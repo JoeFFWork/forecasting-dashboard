@@ -368,12 +368,22 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'Dashboard API running' });
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`\n✅ Forecasting Dashboard API running on port ${PORT}`);
-  console.log(`📊 Dashboard: http://localhost:${PORT}`);
-  console.log(`📤 Upload endpoint: POST /api/upload`);
-  console.log(`📊 Forecast endpoint: GET /api/forecast`);
-});
+// Serve index.html for root path
+   app.get('/', (req, res) => {
+     res.sendFile(path.join(__dirname, 'index.html'));
+   });
 
-module.exports = app;
+   // Catch-all for HTML5 history API
+   app.get('*', (req, res) => {
+     res.sendFile(path.join(__dirname, 'index.html'));
+   });
+
+   // Start server
+   app.listen(PORT, () => {
+     console.log(`\n✅ Forecasting Dashboard API running on port ${PORT}`);
+     console.log(`📊 Dashboard: http://localhost:${PORT}`);
+     console.log(`📤 Upload endpoint: POST /api/upload`);
+     console.log(`📊 Forecast endpoint: GET /api/forecast`);
+   });
+
+   module.exports = app;
