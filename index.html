@@ -188,29 +188,19 @@
             var store = document.getElementById('timelineStore').value;
             var query = store ? '&store=' + store : '';
             fetch(API_URL + '/api/forecast-timeline?weeks=12' + query).then(r => r.json()).then(data => {
-                var content = document.getElementById('timelineContent');
-                content.innerHTML = '';
-                if (!data || !data.length) { content.innerHTML = '<p>No data</p>'; return; }
-                var hasAny = {};
+               var allComms = {};
                 data.forEach(w => {
                     Object.keys(w.stores || {}).forEach(s => {
-                        if (!hasAny[s]) hasAny[s] = new Set();
+                        if (!allComms[s]) allComms[s] = new Set();
                         Object.keys(w.stores[s] || {}).forEach(c => {
-                            if ((w.stores[s][c].startStock > 0 || w.stores[s][c].endStock > 0 || w.stores[s][c].incoming > 0)) {
-                                hasAny[s].add(c);
-                            }
+                            allComms[s].add(c);
                         });
                     });
                 });
+
                 var stores = store ? [store] : ['Newport', 'Kenyon', 'Avonmouth', 'Halder', 'Garston'];
                 stores.forEach(st => {
-                    var comms = hasAny[st] ? Array.from(hasAny[st]).sort() : [];
-                    if (!comms.length) return;
-                    var div = document.createElement('div');
-                    div.className = 'store-timeline';
-                    div.innerHTML = '<div class="store-title">📍 ' + st + '</div>';
-                    comms.forEach(c => {
-                        var row = document.createElement('div');
+                    var comms = allComms[st] ? Array.from(allComms[st]).sort() : [];
                         row.className = 'commodity-row';
                         var label = document.createElement('div');
                         label.className = 'commodity-label';
