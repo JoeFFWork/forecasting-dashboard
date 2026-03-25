@@ -397,11 +397,14 @@
             color: #999;
         }
 
-        .empty-state svg {
-            width: 64px;
-            height: 64px;
-            margin-bottom: 15px;
-            opacity: 0.5;
+        .debug-info {
+            background: #f0f0f0;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            font-size: 12px;
+            color: #666;
+            font-family: monospace;
         }
     </style>
 </head>
@@ -422,6 +425,8 @@
         <!-- OVERVIEW TAB -->
         <div id="overview" class="tab-content active">
             <h2 style="margin-bottom: 20px; color: #2c3e50;">Dashboard Overview</h2>
+            
+            <div class="debug-info" id="debugInfo"></div>
             
             <div class="kpi-grid">
                 <div class="kpi-card">
@@ -605,6 +610,9 @@
     </div>
 
     <script>
+        // Get API base URL
+        const API_BASE = window.location.origin;
+        
         const STORES = ['Kenyon', 'Newport', 'Avonmouth', 'Halder', 'Garston'];
         const TRANSIT_TIMES = {
             'IND': 4,
@@ -620,8 +628,14 @@
 
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
+            showDebugInfo();
             loadData();
         });
+
+        function showDebugInfo() {
+            const debug = document.getElementById('debugInfo');
+            debug.innerHTML = `<strong>API Base:</strong> ${API_BASE}<br><strong>Status:</strong> Connected`;
+        }
 
         function switchTab(tabName) {
             document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
@@ -636,13 +650,47 @@
         }
 
         function loadData() {
-            loadBatches();
-            updateOverview();
-        }
+            console.log('Loading data from:', API_BASE);
+            
+            // Try to load batches from API
+            fetch(`${API_BASE}/api/batches`)
+                .then(response => {
+                    console.log('Response status:', response.status);
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    return response.json();
+                })
+                .then(data => {
+                    console.log('Batches loaded:', data);
+                    allBatches = data;
+                    updateOverview();
+                })
+                .catch(error => {
+                    console.error('Error loading batches:', error);
+                    document.getElementById('storageGrid').innerHTML = `
+                        <div class="error-message">
+                            ❌ Cannot connect to backend API<br>
+                            Make sure server is running on ${API_BASE}
+                        </div>
+                    `;
+                });
 
-        function loadBatches() {
-            allBatches = [];
-            updateOverview();
+            // Load vessels
+            fetch(`${API_BASE}/api/vessels`)
+                .then(response => response.json())
+                .then(data => {
+                    allVessels = data;
+                    renderVessels();
+                })
+                .catch(error => console.error('Error loading vessels:', error));
+
+            // Load capacities
+            fetch(`${API_BASE}/api/capacity`)
+                .then(response => response.json())
+                .then(data => {
+                    capacityLimits = data;
+                    renderCapacity();
+                })
+                .catch(error => console.error('Error loading capacities:', error));
         }
 
         function updateOverview() {
@@ -661,7 +709,7 @@
         }
 
         function calculateTotalInventory() {
-            return allBatches.reduce((sum, batch) => sum + (batch.balance || 0), 0);
+            return allBatches.reduce((sum, batch) => sum + (batch.total_balance || 0), 0);
         }
 
         function renderStorageGrid() {
@@ -684,17 +732,9 @@
                     return '';
                 }
 
-                const byCommodity = {};
-                storeBatches.forEach(batch => {
-                    if (!byCommodity[batch.commodity]) {
-                        byCommodity[batch.commodity] = 0;
-                    }
-                    byCommodity[batch.commodity] += batch.balance || 0;
-                });
-
-                const commoditiesWithStock = Object.entries(byCommodity)
-                    .filter(([name, qty]) => qty > 0)
-                    .sort((a, b) => b[1] - a[1]);
+                const commoditiesWithStock = storeBatches
+                    .filter(batch => batch.total_balance > 0)
+                    .sort((a, b) => b.total_balance - a.total_balance);
 
                 if (commoditiesWithStock.length === 0) {
                     return '';
@@ -703,10 +743,10 @@
                 return `
                     <div class="store-section">
                         <h3>📍 ${store}</h3>
-                        ${commoditiesWithStock.map(([commodity, qty]) => `
+                        ${commoditiesWithStock.map(batch => `
                             <div class="commodity-row">
-                                <span class="commodity-name">${commodity}</span>
-                                <span class="commodity-quantity">${qty.toFixed(1)} MT</span>
+                                <span class="commodity-name">${batch.commodity}</span>
+                                <span class="commodity-quantity">${batch.total_balance.toFixed(1)} MT</span>
                             </div>
                         `).join('')}
                     </div>
@@ -755,7 +795,7 @@
                 });
 
                 Object.entries(byCommodity).forEach(([commodity, batches]) => {
-                    const totalStock = batches.reduce((sum, b) => sum + (b.balance || 0), 0);
+                    const totalStock = batches.reduce((sum, b) => sum + (b.total_balance || 0), 0);
                     
                     if (totalStock === 0) return;
 
@@ -794,16 +834,25 @@
                 return;
             }
 
-            allVessels.push({ name, eta, commodity, tonnage, origin, id: Date.now() });
-            renderVessels();
-            
-            document.getElementById('vesselName').value = '';
-            document.getElementById('vesselETA').value = '';
-            document.getElementById('vesselCommodity').value = '';
-            document.getElementById('vesselTonnage').value = '';
-            document.getElementById('vesselOrigin').value = '';
-
-            updateOverview();
+            fetch(`${API_BASE}/api/vessels`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, eta, commodity, tonnage, origin })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    allVessels.push({ ...data, id: data.id, name, eta, commodity, tonnage, origin });
+                    renderVessels();
+                    document.getElementById('vesselName').value = '';
+                    document.getElementById('vesselETA').value = '';
+                    document.getElementById('vesselCommodity').value = '';
+                    document.getElementById('vesselTonnage').value = '';
+                    document.getElementById('vesselOrigin').value = '';
+                    updateOverview();
+                }
+            })
+            .catch(error => console.error('Error adding vessel:', error));
         }
 
         function renderVessels() {
@@ -827,28 +876,41 @@
         }
 
         function removeVessel(id) {
-            allVessels = allVessels.filter(v => v.id !== id);
-            renderVessels();
-            updateOverview();
+            fetch(`${API_BASE}/api/vessels/${id}`, { method: 'DELETE' })
+                .then(response => response.json())
+                .then(data => {
+                    allVessels = allVessels.filter(v => v.id !== id);
+                    renderVessels();
+                    updateOverview();
+                })
+                .catch(error => console.error('Error removing vessel:', error));
         }
 
         function setCapacity() {
             const store = document.getElementById('capacityStore').value;
             const commodity = document.getElementById('capacityCommodity').value;
-            const limit = parseFloat(document.getElementById('capacityLimit').value);
+            const max_mt = parseFloat(document.getElementById('capacityLimit').value);
 
-            if (!store || !commodity || !limit) {
+            if (!store || !commodity || !max_mt) {
                 alert('Please fill in all fields');
                 return;
             }
 
-            capacityLimits = capacityLimits.filter(c => !(c.store === store && c.commodity === commodity));
-            capacityLimits.push({ store, commodity, limit, id: Date.now() });
-            renderCapacity();
-
-            document.getElementById('capacityStore').value = '';
-            document.getElementById('capacityCommodity').value = '';
-            document.getElementById('capacityLimit').value = '';
+            fetch(`${API_BASE}/api/capacity`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ store, commodity, max_mt })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    loadData();
+                    document.getElementById('capacityStore').value = '';
+                    document.getElementById('capacityCommodity').value = '';
+                    document.getElementById('capacityLimit').value = '';
+                }
+            })
+            .catch(error => console.error('Error setting capacity:', error));
         }
 
         function renderCapacity() {
@@ -863,15 +925,19 @@
                 <tr>
                     <td>${c.store}</td>
                     <td>${c.commodity}</td>
-                    <td>${c.limit.toFixed(1)}</td>
+                    <td>${c.max_mt.toFixed(1)}</td>
                     <td><button onclick="removeCapacity(${c.id})" style="background: #f5576c; padding: 6px 12px; font-size: 12px;">Remove</button></td>
                 </tr>
             `).join('');
         }
 
         function removeCapacity(id) {
-            capacityLimits = capacityLimits.filter(c => c.id !== id);
-            renderCapacity();
+            fetch(`${API_BASE}/api/capacity/${id}`, { method: 'DELETE' })
+                .then(response => response.json())
+                .then(data => {
+                    loadData();
+                })
+                .catch(error => console.error('Error removing capacity:', error));
         }
 
         function handleFileUpload(event) {
@@ -879,24 +945,29 @@
             if (!file) return;
 
             const status = document.getElementById('uploadStatus');
-            status.innerHTML = '<div class="loading"><div class="spinner"></div>Parsing Excel file...</div>';
+            status.innerHTML = '<div class="loading"><div class="spinner"></div>Uploading Excel file...</div>';
 
-            const reader = new FileReader();
-            reader.onload = (e) => {
-                try {
-                    const data = new Uint8Array(e.target.result);
-                    parseExcel(data);
-                    status.innerHTML = '<div class="success-message">✓ File uploaded successfully!</div>';
-                    updateOverview();
-                } catch (error) {
-                    status.innerHTML = `<div class="error-message">✗ Error: ${error.message}</div>`;
+            const formData = new FormData();
+            formData.append('file', file);
+
+            fetch(`${API_BASE}/api/upload`, {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    status.innerHTML = `<div class="success-message">✓ ${data.message}</div>`;
+                    loadData();
+                    document.getElementById('excelFile').value = '';
+                } else {
+                    status.innerHTML = `<div class="error-message">✗ Error: ${data.error}</div>`;
                 }
-            };
-            reader.readAsArrayBuffer(file);
-        }
-
-        function parseExcel(data) {
-            status.innerHTML = '<div class="error-message">Excel parsing requires SheetJS library. Add it to your server.</div>';
+            })
+            .catch(error => {
+                console.error('Error uploading file:', error);
+                status.innerHTML = `<div class="error-message">✗ Upload failed: ${error.message}</div>`;
+            });
         }
     </script>
 </body>
