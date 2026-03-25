@@ -1,0 +1,889 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Organic Commodities Forecasting Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #f5f5f5;
+            color: #333;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+            color: white;
+            padding: 20px 40px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+
+        .header h1 {
+            font-size: 28px;
+            font-weight: 600;
+        }
+
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #ddd;
+            background: white;
+            padding: 0 20px;
+            border-radius: 8px 8px 0 0;
+        }
+
+        .tab-button {
+            padding: 15px 20px;
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            color: #666;
+            border-bottom: 3px solid transparent;
+            transition: all 0.3s ease;
+        }
+
+        .tab-button.active {
+            color: #2c3e50;
+            border-bottom-color: #2c3e50;
+        }
+
+        .tab-button:hover {
+            color: #2c3e50;
+            background: #f9f9f9;
+        }
+
+        .tab-content {
+            display: none;
+            background: white;
+            padding: 20px;
+            border-radius: 0 8px 8px 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        .kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+
+        .kpi-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+
+        .kpi-card.warning {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        }
+
+        .kpi-label {
+            font-size: 12px;
+            opacity: 0.9;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .kpi-value {
+            font-size: 28px;
+            font-weight: 700;
+        }
+
+        .storage-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+        }
+
+        .store-section {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            border-left: 4px solid #667eea;
+        }
+
+        .store-section h3 {
+            margin-bottom: 15px;
+            color: #2c3e50;
+            font-size: 16px;
+        }
+
+        .commodity-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 0;
+            border-bottom: 1px solid #f0f0f0;
+            font-size: 13px;
+        }
+
+        .commodity-row:last-child {
+            border-bottom: none;
+        }
+
+        .commodity-name {
+            flex: 1;
+            font-weight: 500;
+            color: #333;
+        }
+
+        .commodity-quantity {
+            text-align: right;
+            color: #667eea;
+            font-weight: 600;
+            min-width: 80px;
+        }
+
+        .timeline-container {
+            overflow-x: auto;
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        }
+
+        .timeline-grid {
+            display: grid;
+            grid-template-columns: 200px repeat(12, 150px);
+            gap: 10px;
+            min-width: 1800px;
+        }
+
+        .timeline-header {
+            font-weight: 600;
+            color: #2c3e50;
+            padding: 10px;
+            background: #f9f9f9;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+
+        .timeline-week-header {
+            text-align: center;
+            font-weight: 700;
+            color: white;
+            background: #667eea;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 11px;
+        }
+
+        .timeline-cell {
+            padding: 10px;
+            border-radius: 4px;
+            background: #f9f9f9;
+            text-align: center;
+            font-size: 12px;
+            border: 1px solid #eee;
+        }
+
+        .timeline-cell.positive {
+            background: #d4edda;
+            color: #155724;
+            font-weight: 600;
+        }
+
+        .timeline-cell.warning {
+            background: #fff3cd;
+            color: #856404;
+            font-weight: 600;
+        }
+
+        .timeline-cell.danger {
+            background: #f8d7da;
+            color: #721c24;
+            font-weight: 600;
+        }
+
+        .store-header {
+            grid-column: 1;
+            font-weight: 700;
+            color: white;
+            background: #2c3e50;
+            padding: 12px;
+            border-radius: 4px;
+        }
+
+        .commodity-header {
+            grid-column: 1;
+            font-size: 11px;
+            font-weight: 600;
+            color: #666;
+            background: #f0f0f0;
+            padding: 10px;
+            border-radius: 4px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #2c3e50;
+            font-size: 14px;
+        }
+
+        input, select, textarea {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+            font-family: inherit;
+        }
+
+        input:focus, select:focus, textarea:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+
+        button {
+            background: #667eea;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 4px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 14px;
+        }
+
+        button:hover {
+            background: #5568d3;
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+        }
+
+        .file-input-wrapper {
+            position: relative;
+            display: inline-block;
+            width: 100%;
+        }
+
+        .file-input-wrapper input[type="file"] {
+            display: none;
+        }
+
+        .file-input-label {
+            display: block;
+            padding: 12px;
+            background: #667eea;
+            color: white;
+            border-radius: 4px;
+            cursor: pointer;
+            text-align: center;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+
+        .file-input-label:hover {
+            background: #5568d3;
+        }
+
+        .table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+            font-size: 13px;
+        }
+
+        .table th {
+            background: #f0f0f0;
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+            color: #2c3e50;
+            border-bottom: 2px solid #ddd;
+        }
+
+        .table td {
+            padding: 10px 12px;
+            border-bottom: 1px solid #eee;
+        }
+
+        .table tr:hover {
+            background: #f9f9f9;
+        }
+
+        .success-message {
+            background: #d4edda;
+            color: #155724;
+            padding: 12px;
+            border-radius: 4px;
+            margin-bottom: 15px;
+            border: 1px solid #c3e6cb;
+        }
+
+        .error-message {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 12px;
+            border-radius: 4px;
+            margin-bottom: 15px;
+            border: 1px solid #f5c6cb;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 15px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #999;
+        }
+
+        .debug-info {
+            background: #e3f2fd;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            font-size: 12px;
+            color: #1565c0;
+            border-left: 4px solid #1976d2;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>📊 Organic Commodities Forecasting Dashboard</h1>
+    </div>
+
+    <div class="container">
+        <div class="debug-info" id="debugInfo"></div>
+
+        <div class="tabs">
+            <button class="tab-button active" onclick="switchTab('overview')">Overview</button>
+            <button class="tab-button" onclick="switchTab('forecast')">Forecast Timeline</button>
+            <button class="tab-button" onclick="switchTab('vessels')">Incoming Vessels</button>
+            <button class="tab-button" onclick="switchTab('capacity')">Warehouse Capacity</button>
+            <button class="tab-button" onclick="switchTab('batches')">Batch Management</button>
+        </div>
+
+        <!-- OVERVIEW TAB -->
+        <div id="overview" class="tab-content active">
+            <h2 style="margin-bottom: 20px; color: #2c3e50;">Dashboard Overview</h2>
+            
+            <div class="kpi-grid">
+                <div class="kpi-card">
+                    <div class="kpi-label">Total Inventory</div>
+                    <div class="kpi-value" id="totalInventory">0 MT</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Number of Commodities</div>
+                    <div class="kpi-value" id="commodityCount">0</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Active Stores</div>
+                    <div class="kpi-value" id="storeCount">5</div>
+                </div>
+                <div class="kpi-card warning">
+                    <div class="kpi-label">Pending Vessels</div>
+                    <div class="kpi-value" id="vesselCount">0</div>
+                </div>
+            </div>
+
+            <h3 style="margin: 30px 0 20px; color: #2c3e50;">Current Stock by Store</h3>
+            <div class="storage-grid" id="storageGrid">
+                <div class="loading">
+                    <div class="spinner"></div>
+                    Loading inventory data...
+                </div>
+            </div>
+        </div>
+
+        <!-- FORECAST TIMELINE TAB -->
+        <div id="forecast" class="tab-content">
+            <h2 style="margin-bottom: 20px; color: #2c3e50;">12-Week Rolling Forecast</h2>
+            
+            <div class="timeline-container">
+                <div class="timeline-grid" id="timelineGrid">
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        Loading forecast data...
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- INCOMING VESSELS TAB -->
+        <div id="vessels" class="tab-content">
+            <h2 style="margin-bottom: 20px; color: #2c3e50;">Incoming Vessels</h2>
+            
+            <div style="background: white; padding: 20px; border-radius: 8px; margin-bottom: 30px;">
+                <h3 style="margin-bottom: 20px; color: #2c3e50;">Add New Vessel</h3>
+                
+                <div class="form-group">
+                    <label>Vessel Name</label>
+                    <input type="text" id="vesselName" placeholder="Enter vessel name">
+                </div>
+
+                <div class="form-group">
+                    <label>ETA (Estimated Time of Arrival)</label>
+                    <input type="date" id="vesselETA">
+                </div>
+
+                <div class="form-group">
+                    <label>Commodity</label>
+                    <input type="text" id="vesselCommodity" placeholder="e.g., SOYA, MAIZE">
+                </div>
+
+                <div class="form-group">
+                    <label>Tonnage (MT)</label>
+                    <input type="number" id="vesselTonnage" placeholder="0" step="0.01">
+                </div>
+
+                <div class="form-group">
+                    <label>Origin</label>
+                    <select id="vesselOrigin">
+                        <option value="">Select Origin</option>
+                        <option value="IND">India</option>
+                        <option value="TUR">Turkey</option>
+                        <option value="AF">Africa</option>
+                        <option value="MD">Moldova</option>
+                        <option value="THA">Thailand</option>
+                    </select>
+                </div>
+
+                <button onclick="addVessel()">Add Vessel</button>
+            </div>
+
+            <h3 style="margin-bottom: 20px; color: #2c3e50;">Pending Arrivals</h3>
+            <table class="table" id="vesselTable">
+                <thead>
+                    <tr>
+                        <th>Vessel Name</th>
+                        <th>Commodity</th>
+                        <th>ETA</th>
+                        <th>Tonnage (MT)</th>
+                        <th>Origin</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody id="vesselBody">
+                    <tr>
+                        <td colspan="6" style="text-align: center; color: #999;">No vessels recorded yet</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- WAREHOUSE CAPACITY TAB -->
+        <div id="capacity" class="tab-content">
+            <h2 style="margin-bottom: 20px; color: #2c3e50;">Warehouse Capacity Management</h2>
+            
+            <div style="background: white; padding: 20px; border-radius: 8px; margin-bottom: 30px;">
+                <h3 style="margin-bottom: 20px; color: #2c3e50;">Set Maximum Capacity</h3>
+                
+                <div class="form-group">
+                    <label>Store</label>
+                    <select id="capacityStore">
+                        <option value="">Select Store</option>
+                        <option value="Kenyon">Kenyon</option>
+                        <option value="Newport">Newport</option>
+                        <option value="Avonmouth">Avonmouth</option>
+                        <option value="Halder">Halder</option>
+                        <option value="Garston">Garston</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>Commodity</label>
+                    <input type="text" id="capacityCommodity" placeholder="e.g., SOYA">
+                </div>
+
+                <div class="form-group">
+                    <label>Maximum Capacity (MT)</label>
+                    <input type="number" id="capacityLimit" placeholder="0" step="0.01">
+                </div>
+
+                <button onclick="setCapacity()">Set Capacity</button>
+            </div>
+
+            <h3 style="margin-bottom: 20px; color: #2c3e50;">Current Capacities</h3>
+            <table class="table" id="capacityTable">
+                <thead>
+                    <tr>
+                        <th>Store</th>
+                        <th>Commodity</th>
+                        <th>Maximum (MT)</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody id="capacityBody">
+                    <tr>
+                        <td colspan="4" style="text-align: center; color: #999;">No capacity limits set</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- BATCH MANAGEMENT TAB -->
+        <div id="batches" class="tab-content">
+            <h2 style="margin-bottom: 20px; color: #2c3e50;">Batch Management</h2>
+            
+            <div style="background: white; padding: 20px; border-radius: 8px; margin-bottom: 30px;">
+                <h3 style="margin-bottom: 20px; color: #2c3e50;">Upload Weekly Physical Stocks</h3>
+                
+                <div class="form-group">
+                    <label>Select Excel File (Weekly_Physical_Stocks_New__5_.xlsx)</label>
+                    <div class="file-input-wrapper">
+                        <input type="file" id="excelFile" accept=".xlsx,.xls" onchange="handleFileUpload(event)">
+                        <label for="excelFile" class="file-input-label">📁 Choose Excel File</label>
+                    </div>
+                </div>
+
+                <div id="uploadStatus"></div>
+            </div>
+
+            <h3 style="margin-bottom: 20px; color: #2c3e50;">Recent Batch Uploads</h3>
+            <div id="batchList">
+                <div class="empty-state">
+                    <p>No uploads yet. Start by uploading the weekly physical stocks Excel file.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const STORES = ['Kenyon', 'Newport', 'Avonmouth', 'Halder', 'Garston'];
+        const API_BASE = window.location.origin;
+
+        let allBatches = [];
+        let allVessels = [];
+        let capacityLimits = [];
+
+        document.addEventListener('DOMContentLoaded', () => {
+            showDebugInfo();
+            loadData();
+        });
+
+        function showDebugInfo() {
+            const debug = document.getElementById('debugInfo');
+            debug.innerHTML = `✓ Connected to API: <strong>${API_BASE}</strong>`;
+        }
+
+        function switchTab(tabName) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.tab-button').forEach(el => el.classList.remove('active'));
+            document.getElementById(tabName).classList.add('active');
+            event.target.classList.add('active');
+
+            if (tabName === 'forecast') {
+                generateTimeline();
+            }
+        }
+
+        function loadData() {
+            console.log('Loading data from:', API_BASE);
+
+            fetch(`${API_BASE}/api/batches`)
+                .then(response => {
+                    console.log('Batches response:', response.status);
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    return response.json();
+                })
+                .then(data => {
+                    console.log('Batches data:', data);
+                    allBatches = data;
+                    updateOverview();
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    document.getElementById('storageGrid').innerHTML = `
+                        <div class="error-message">
+                            ❌ Connection Error: ${error.message}<br>
+                            Check browser console (F12) for details
+                        </div>
+                    `;
+                });
+
+            fetch(`${API_BASE}/api/vessels`)
+                .then(response => response.json())
+                .then(data => {
+                    allVessels = data;
+                    renderVessels();
+                    updateOverview();
+                })
+                .catch(error => console.error('Vessels error:', error));
+
+            fetch(`${API_BASE}/api/capacity`)
+                .then(response => response.json())
+                .then(data => {
+                    capacityLimits = data;
+                    renderCapacity();
+                })
+                .catch(error => console.error('Capacity error:', error));
+        }
+
+        function updateOverview() {
+            const totalMT = allBatches.reduce((sum, batch) => sum + (batch.total_balance || 0), 0);
+            const uniqueCommodities = new Set(allBatches.map(b => b.commodity));
+
+            document.getElementById('totalInventory').textContent = `${totalMT.toFixed(1)} MT`;
+            document.getElementById('commodityCount').textContent = uniqueCommodities.size;
+            document.getElementById('vesselCount').textContent = allVessels.length;
+
+            renderStorageGrid();
+        }
+
+        function renderStorageGrid() {
+            const grid = document.getElementById('storageGrid');
+            
+            if (!allBatches || allBatches.length === 0) {
+                grid.innerHTML = '<div class="empty-state">No inventory data. Upload Excel file in Batch Management tab.</div>';
+                return;
+            }
+
+            const byStore = {};
+            STORES.forEach(store => {
+                byStore[store] = allBatches.filter(b => b.store === store && b.total_balance > 0);
+            });
+
+            const storeHtml = STORES.map(store => {
+                const storeBatches = byStore[store];
+                if (storeBatches.length === 0) return '';
+
+                return `
+                    <div class="store-section">
+                        <h3>📍 ${store}</h3>
+                        ${storeBatches
+                            .sort((a, b) => b.total_balance - a.total_balance)
+                            .map(batch => `
+                                <div class="commodity-row">
+                                    <span class="commodity-name">${batch.commodity}</span>
+                                    <span class="commodity-quantity">${batch.total_balance.toFixed(1)} MT</span>
+                                </div>
+                            `).join('')}
+                    </div>
+                `;
+            }).filter(html => html);
+
+            grid.innerHTML = storeHtml.length > 0 ? storeHtml.join('') : '<div class="empty-state">No commodities with stock</div>';
+        }
+
+        function generateTimeline() {
+            const timelineGrid = document.getElementById('timelineGrid');
+            const weeks = 12;
+
+            if (!allBatches || allBatches.length === 0) {
+                timelineGrid.innerHTML = '<div class="empty-state">No forecast data. Upload Excel file first.</div>';
+                return;
+            }
+
+            const byStore = {};
+            STORES.forEach(store => {
+                byStore[store] = allBatches.filter(b => b.store === store && b.total_balance > 0);
+            });
+
+            let html = '<div class="timeline-header"></div>';
+            for (let w = 1; w <= weeks; w++) {
+                const date = new Date();
+                date.setDate(date.getDate() + (w - 1) * 7);
+                html += `<div class="timeline-week-header">W${w}<br>${date.toLocaleDateString('en-GB', {month: 'short', day: 'numeric'})}</div>`;
+            }
+
+            Object.keys(byStore).forEach(store => {
+                byStore[store].forEach(batch => {
+                    const stock = batch.total_balance;
+                    html += `<div class="store-header">${store}</div>`;
+                    html += `<div class="commodity-header">${batch.commodity}</div>`;
+
+                    for (let w = 1; w <= weeks; w++) {
+                        const forecast = Math.max(0, stock - (w * 10)).toFixed(1);
+                        let cellClass = 'timeline-cell';
+                        if (forecast < 0) cellClass += ' danger';
+                        else if (forecast < stock * 0.2) cellClass += ' warning';
+                        else cellClass += ' positive';
+
+                        html += `<div class="${cellClass}">${forecast} MT</div>`;
+                    }
+                });
+            });
+
+            timelineGrid.innerHTML = html;
+        }
+
+        function addVessel() {
+            const name = document.getElementById('vesselName').value;
+            const eta = document.getElementById('vesselETA').value;
+            const commodity = document.getElementById('vesselCommodity').value;
+            const tonnage = parseFloat(document.getElementById('vesselTonnage').value);
+            const origin = document.getElementById('vesselOrigin').value;
+
+            if (!name || !eta || !commodity || !tonnage || !origin) {
+                alert('Fill all fields');
+                return;
+            }
+
+            fetch(`${API_BASE}/api/vessels`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, eta, commodity, tonnage, origin })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    loadData();
+                    document.getElementById('vesselName').value = '';
+                    document.getElementById('vesselETA').value = '';
+                    document.getElementById('vesselCommodity').value = '';
+                    document.getElementById('vesselTonnage').value = '';
+                    document.getElementById('vesselOrigin').value = '';
+                }
+            })
+            .catch(e => console.error('Error:', e));
+        }
+
+        function renderVessels() {
+            const tbody = document.getElementById('vesselBody');
+            if (!allVessels || allVessels.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: #999;">No vessels</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = allVessels.map(v => `
+                <tr>
+                    <td>${v.name}</td>
+                    <td>${v.commodity}</td>
+                    <td>${new Date(v.eta).toLocaleDateString('en-GB')}</td>
+                    <td>${v.tonnage.toFixed(1)}</td>
+                    <td>${v.origin}</td>
+                    <td><button onclick="removeVessel(${v.id})" style="background: #f5576c; padding: 6px 12px; font-size: 12px;">Remove</button></td>
+                </tr>
+            `).join('');
+        }
+
+        function removeVessel(id) {
+            fetch(`${API_BASE}/api/vessels/${id}`, { method: 'DELETE' })
+                .then(r => r.json())
+                .then(() => loadData())
+                .catch(e => console.error('Error:', e));
+        }
+
+        function setCapacity() {
+            const store = document.getElementById('capacityStore').value;
+            const commodity = document.getElementById('capacityCommodity').value;
+            const max_mt = parseFloat(document.getElementById('capacityLimit').value);
+
+            if (!store || !commodity || !max_mt) {
+                alert('Fill all fields');
+                return;
+            }
+
+            fetch(`${API_BASE}/api/capacity`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ store, commodity, max_mt })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    loadData();
+                    document.getElementById('capacityStore').value = '';
+                    document.getElementById('capacityCommodity').value = '';
+                    document.getElementById('capacityLimit').value = '';
+                }
+            })
+            .catch(e => console.error('Error:', e));
+        }
+
+        function renderCapacity() {
+            const tbody = document.getElementById('capacityBody');
+            if (!capacityLimits || capacityLimits.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #999;">No limits set</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = capacityLimits.map(c => `
+                <tr>
+                    <td>${c.store}</td>
+                    <td>${c.commodity}</td>
+                    <td>${c.max_mt.toFixed(1)}</td>
+                    <td><button onclick="removeCapacity(${c.id})" style="background: #f5576c; padding: 6px 12px; font-size: 12px;">Remove</button></td>
+                </tr>
+            `).join('');
+        }
+
+        function removeCapacity(id) {
+            fetch(`${API_BASE}/api/capacity/${id}`, { method: 'DELETE' })
+                .then(r => r.json())
+                .then(() => loadData())
+                .catch(e => console.error('Error:', e));
+        }
+
+        function handleFileUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const status = document.getElementById('uploadStatus');
+            status.innerHTML = '<div class="loading"><div class="spinner"></div>Uploading...</div>';
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            fetch(`${API_BASE}/api/upload`, {
+                method: 'POST',
+                body: formData
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    status.innerHTML = `<div class="success-message">✓ ${data.message}</div>`;
+                    loadData();
+                    document.getElementById('excelFile').value = '';
+                } else {
+                    status.innerHTML = `<div class="error-message">✗ ${data.error}</div>`;
+                }
+            })
+            .catch(error => {
+                status.innerHTML = `<div class="error-message">✗ Upload failed: ${error.message}</div>`;
+            });
+        }
+    </script>
+</body>
+</html>
