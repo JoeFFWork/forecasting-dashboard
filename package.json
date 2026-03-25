@@ -1,7 +1,7 @@
 {
   "name": "forecasting-dashboard",
   "version": "1.0.0",
-  "description": "Tonnage-based forecasting dashboard",
+  "description": "Tonnage-based batch tracking dashboard",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
