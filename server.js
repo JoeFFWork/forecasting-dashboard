@@ -174,6 +174,21 @@ app.post('/api/upload-stock', upload.single('file'), (req, res) => {
       });
     }
 
+    // Halder sheet - USES COMMODITY COLUMN
+    if (workbook.SheetNames.includes('This Week HA')) {
+      const ws = workbook.Sheets['This Week HA'];
+      const data = XLSX.utils.sheet_to_json(ws);
+      data.forEach(row => {
+        if (!row.BATCH || row['TOTAL '] === 0 || row['TOTAL '] === undefined) return;
+        db.run(`INSERT OR REPLACE INTO batches (batch_id, store, commodity, tonnage, origin, vessel, spec, status)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 'in_stock')`,
+          [String(row.BATCH), 'Halder', row.COMMODITY || '', parseFloat(row['TOTAL ']) || 0, 
+           row.ORIGIN || '', '', row.SPEC || ''],
+          function(err) { if (!err) batchesImported++; }
+        );
+      });
+    }
+
     // Garston sheet - USES PRODUCT COLUMN
     if (workbook.SheetNames.includes('This Week GA')) {
       const ws = workbook.Sheets['This Week GA'];
