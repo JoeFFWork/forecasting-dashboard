@@ -13,7 +13,6 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname)));
 
-// File upload setup
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
@@ -29,7 +28,6 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage });
 
-// Database
 const dbPath = path.join(__dirname, 'forecasting.db');
 const db = new sqlite3.Database(dbPath);
 
@@ -130,43 +128,75 @@ app.post('/api/upload-stock', upload.single('file'), (req, res) => {
     const workbook = XLSX.readFile(filePath);
     
     let batchesImported = 0;
-    const storeSheets = ['This Week Kenyon', 'NP This Week', 'This Week AV', 'This Week GA'];
-    const storeMap = {
-      'This Week Kenyon': 'Kenyon',
-      'NP This Week': 'Newport',
-      'This Week AV': 'Avonmouth',
-      'This Week GA': 'Garston'
-    };
 
-    storeSheets.forEach(sheetName => {
-      if (!workbook.SheetNames.includes(sheetName)) return;
-      
-      const ws = workbook.Sheets[sheetName];
+    // Kenyon sheet
+    if (workbook.SheetNames.includes('This Week Kenyon')) {
+      const ws = workbook.Sheets['This Week Kenyon'];
       const data = XLSX.utils.sheet_to_json(ws);
-      const store = storeMap[sheetName];
-
       data.forEach(row => {
-        if (!row.Batch || !row.Balance) return;
-
+        if (!row.Batch || row.Balance === 0 || row.Balance === undefined) return;
         db.run(`INSERT OR REPLACE INTO batches (batch_id, store, commodity, tonnage, origin, vessel, spec, status)
           VALUES (?, ?, ?, ?, ?, ?, ?, 'in_stock')`,
-          [String(row.Batch), store, row.Commodity || '', parseFloat(row.Balance) || 0, 
+          [String(row.Batch), 'Kenyon', row.Commodity || '', parseFloat(row.Balance) || 0, 
            row.Origin || '', row.Vessel || '', row.Spec || ''],
-          function(err) {
-            if (!err) batchesImported++;
-          }
+          function(err) { if (!err) batchesImported++; }
         );
       });
-    });
+    }
+
+    // Newport sheet (NP This Week)
+    if (workbook.SheetNames.includes('NP This Week')) {
+      const ws = workbook.Sheets['NP This Week'];
+      const data = XLSX.utils.sheet_to_json(ws);
+      data.forEach(row => {
+        if (!row.Batch || row.Weight === 0 || row.Weight === undefined) return;
+        db.run(`INSERT OR REPLACE INTO batches (batch_id, store, commodity, tonnage, origin, vessel, spec, status)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 'in_stock')`,
+          [String(row.Batch), 'Newport', row.Product || '', parseFloat(row.Weight) || 0, 
+           row.Origin || '', row.Visit || '', row.SPEC || ''],
+          function(err) { if (!err) batchesImported++; }
+        );
+      });
+    }
+
+    // Avonmouth sheet - USES COMMODITY COLUMN
+    if (workbook.SheetNames.includes('This Week AV')) {
+      const ws = workbook.Sheets['This Week AV'];
+      const data = XLSX.utils.sheet_to_json(ws);
+      data.forEach(row => {
+        if (!row.BATCH || row['TOTAL '] === 0 || row['TOTAL '] === undefined) return;
+        db.run(`INSERT OR REPLACE INTO batches (batch_id, store, commodity, tonnage, origin, vessel, spec, status)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 'in_stock')`,
+          [String(row.BATCH), 'Avonmouth', row.COMMODITY || row.PRODUCT || '', parseFloat(row['TOTAL ']) || 0, 
+           row.ORIGIN || '', '', row.SPEC || ''],
+          function(err) { if (!err) batchesImported++; }
+        );
+      });
+    }
+
+    // Garston sheet - USES PRODUCT COLUMN
+    if (workbook.SheetNames.includes('This Week GA')) {
+      const ws = workbook.Sheets['This Week GA'];
+      const data = XLSX.utils.sheet_to_json(ws);
+      data.forEach(row => {
+        if (!row.BATCH || row['TOTAL '] === 0 || row['TOTAL '] === undefined) return;
+        db.run(`INSERT OR REPLACE INTO batches (batch_id, store, commodity, tonnage, origin, vessel, spec, status)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 'in_stock')`,
+          [String(row.BATCH), 'Garston', row.PRODUCT || '', parseFloat(row['TOTAL ']) || 0, 
+           row.ORIGIN || '', row.Vessel || '', row.SPEC || ''],
+          function(err) { if (!err) batchesImported++; }
+        );
+      });
+    }
 
     setTimeout(() => {
       db.run(`INSERT INTO file_uploads (filename, file_type, batches_imported) VALUES (?, ?, ?)`,
         [req.file.filename, 'stock_sheet', batchesImported],
         function(err) {
-          res.json({ success: true, message: `${batchesImported} batches imported`, batches_imported: batchesImported });
+          res.json({ success: true, message: `✅ ${batchesImported} batches imported`, batches_imported: batchesImported });
         }
       );
-    }, 1000);
+    }, 1500);
 
   } catch (error) {
     res.status(500).json({ error: 'File processing failed', details: error.message });
