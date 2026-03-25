@@ -79,7 +79,7 @@
 
             <div id="timeline" class="tab-content">
                 <h2>📈 12-Week Forecast Timeline</h2>
-                <p style="margin-bottom: 15px; color: #666;">Only shows commodities with actual stock</p>
+                <p style="margin-bottom: 15px; color: #666;">Shows all commodities by store</p>
                 <div class="form-group">
                     <select id="timelineStore" onchange="loadTimeline()">
                         <option value="">All Stores</option>
@@ -188,7 +188,10 @@
             var store = document.getElementById('timelineStore').value;
             var query = store ? '&store=' + store : '';
             fetch(API_URL + '/api/forecast-timeline?weeks=12' + query).then(r => r.json()).then(data => {
-               var allComms = {};
+                var content = document.getElementById('timelineContent');
+                content.innerHTML = '';
+                if (!data || !data.length) { content.innerHTML = '<p>No data</p>'; return; }
+                var allComms = {};
                 data.forEach(w => {
                     Object.keys(w.stores || {}).forEach(s => {
                         if (!allComms[s]) allComms[s] = new Set();
@@ -197,10 +200,15 @@
                         });
                     });
                 });
-
                 var stores = store ? [store] : ['Newport', 'Kenyon', 'Avonmouth', 'Halder', 'Garston'];
                 stores.forEach(st => {
                     var comms = allComms[st] ? Array.from(allComms[st]).sort() : [];
+                    if (!comms.length) return;
+                    var div = document.createElement('div');
+                    div.className = 'store-timeline';
+                    div.innerHTML = '<div class="store-title">📍 ' + st + '</div>';
+                    comms.forEach(c => {
+                        var row = document.createElement('div');
                         row.className = 'commodity-row';
                         var label = document.createElement('div');
                         label.className = 'commodity-label';
