@@ -1,435 +1,450 @@
 const express = require('express');
 const cors = require('cors');
-const path = require('path');
-const fs = require('fs');
-const sqlite3 = require('sqlite3').verbose();
 const multer = require('multer');
+const path = require('path');
 const XLSX = require('xlsx');
+const sqlite3 = require('sqlite3').verbose();
+const fs = require('fs');
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 3000;
 
+// Middleware
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname)));
+app.use(express.static(path.join(__dirname, 'public')));
 
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
+// File upload setup
+const upload = multer({ dest: 'uploads/' });
+
+// Database setup
+const db = new sqlite3.Database('./forecasting.db', (err) => {
+    if (err) console.error('DB connection error:', err);
+    else console.log('Connected to SQLite database');
+});
+
+// Create tables if they don't exist
+const initDB = () => {
+    db.serialize(() => {
+        db.run(`
+            CREATE TABLE IF NOT EXISTS batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store TEXT NOT NULL,
+                batch INTEGER,
+                commodity TEXT NOT NULL,
+                balance REAL,
+                origin TEXT,
+                vessel TEXT,
+                spec TEXT,
+                uid TEXT,
+                uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        db.run(`
+            CREATE TABLE IF NOT EXISTS incoming_vessels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                eta TEXT NOT NULL,
+                commodity TEXT NOT NULL,
+                tonnage REAL NOT NULL,
+                origin TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        db.run(`
+            CREATE TABLE IF NOT EXISTS warehouse_capacity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store TEXT NOT NULL,
+                commodity TEXT NOT NULL,
+                max_mt REAL NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(store, commodity)
+            )
+        `);
+
+        db.run(`
+            CREATE TABLE IF NOT EXISTS file_uploads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT NOT NULL,
+                batch_count INTEGER,
+                uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+    });
+};
+
+initDB();
+
+// ============= EXCEL PARSING LOGIC =============
+
+const SHEET_NAMES = {
+    'kenyon': 'This Week Kenyon',
+    'newport': 'NP This Week',
+    'avonmouth': 'This Week AV',
+    'halder': 'This Week HA',
+    'garston': 'This Week GA'
+};
+
+const COLUMN_MAPPING = {
+    'kenyon': { batch: 0, commodity: 1, balance: 3, origin: 4, vessel: 2, spec: 5 },
+    'newport': { commodity: 0, balance: 1, batch: 3, origin: 6, vessel: 4, spec: 7 },
+    'avonmouth': { batch: 0, commodity: 2, balance: 1, origin: 3, vessel: null, spec: 4 },
+    'halder': { batch: 0, commodity: 2, balance: 1, origin: 3, vessel: null, spec: 4 },
+    'garston': { batch: 0, commodity: 1, balance: 2, origin: 4, vessel: 3, spec: 5 }
+};
+
+function parseExcelFile(filePath) {
+    const workbook = XLSX.readFile(filePath);
+    const batches = [];
+    const processedStores = new Set();
+
+    Object.entries(SHEET_NAMES).forEach(([storeKey, sheetName]) => {
+        // Check if store already processed (avoid duplicates)
+        if (processedStores.has(storeKey)) {
+            console.log(`⚠️  Skipping duplicate store: ${storeKey}`);
+            return;
+        }
+
+        if (!workbook.SheetNames.includes(sheetName)) {
+            console.log(`Sheet not found: ${sheetName}`);
+            return;
+        }
+
+        const worksheet = workbook.Sheets[sheetName];
+        const data = XLSX.utils.sheet_to_json(worksheet, { header: 0 });
+        const mapping = COLUMN_MAPPING[storeKey];
+        const store = storeKey.charAt(0).toUpperCase() + storeKey.slice(1);
+
+        console.log(`\n📖 Parsing ${storeKey.toUpperCase()}:`);
+        console.log(`   Sheet: ${sheetName}, Rows: ${data.length}`);
+
+        // Track commodities in this store
+        const commoditiesInStore = new Map();
+
+        data.forEach((row, idx) => {
+            try {
+                // Get column values
+                const colNames = Object.keys(row);
+                let balance = null;
+                let commodity = null;
+                let batch = null;
+                let origin = null;
+                let vessel = null;
+                let spec = null;
+
+                // Flexible column parsing - look for key column names
+                colNames.forEach((col, colIdx) => {
+                    const colLower = col.toLowerCase().trim();
+                    
+                    if (colLower.includes('batch')) batch = row[col];
+                    if (colLower.includes('commodit') || colLower.includes('product')) commodity = row[col];
+                    if (colLower.includes('balance') || colLower.includes('weight') || colLower.includes('total')) balance = row[col];
+                    if (colLower.includes('origin')) origin = row[col];
+                    if (colLower.includes('vessel')) vessel = row[col];
+                    if (colLower.includes('spec')) spec = row[col];
+                });
+
+                // Parse balance as number
+                if (balance) {
+                    balance = parseFloat(balance);
+                    if (isNaN(balance)) balance = 0;
+                }
+
+                // Skip rows with no commodity or zero balance
+                if (!commodity || balance === 0 || balance === null || balance === '') {
+                    return;
+                }
+
+                // Normalize commodity name
+                commodity = String(commodity).trim().toUpperCase();
+
+                // Track this commodity
+                if (!commoditiesInStore.has(commodity)) {
+                    commoditiesInStore.set(commodity, 0);
+                }
+                commoditiesInStore.set(commodity, commoditiesInStore.get(commodity) + balance);
+
+                batches.push({
+                    store: store,
+                    batch: batch ? parseInt(batch) : null,
+                    commodity: commodity,
+                    balance: balance,
+                    origin: origin ? String(origin).trim() : null,
+                    vessel: vessel ? String(vessel).trim() : null,
+                    spec: spec ? String(spec).trim() : null
+                });
+
+            } catch (e) {
+                console.error(`   ✗ Row ${idx + 1} error:`, e.message);
+            }
+        });
+
+        // Log summary for this store
+        console.log(`   ✓ Found ${commoditiesInStore.size} commodities:`);
+        commoditiesInStore.forEach((qty, commodity) => {
+            console.log(`     • ${commodity}: ${qty.toFixed(1)} MT`);
+        });
+
+        processedStores.add(storeKey);
+    });
+
+    console.log(`\n📊 Total batches parsed: ${batches.length}`);
+    return batches;
 }
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => { cb(null, uploadDir); },
-  filename: (req, file, cb) => {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    cb(null, `${timestamp}-${file.originalname}`);
-  }
-});
+// ============= API ENDPOINTS =============
 
-const upload = multer({ storage });
-
-const dbPath = path.join(__dirname, 'forecasting.db');
-const db = new sqlite3.Database(dbPath);
-
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS batches (
-    id INTEGER PRIMARY KEY,
-    batch_id TEXT,
-    store TEXT,
-    commodity TEXT,
-    tonnage REAL,
-    origin TEXT,
-    vessel TEXT,
-    spec TEXT,
-    status TEXT DEFAULT 'in_stock',
-    date_added DATETIME DEFAULT CURRENT_TIMESTAMP,
-    date_removed DATETIME
-  )`);
-
-  db.run(`CREATE TABLE IF NOT EXISTS incoming_vessels (
-    id INTEGER PRIMARY KEY,
-    vessel_name TEXT NOT NULL,
-    commodity TEXT NOT NULL,
-    store TEXT NOT NULL,
-    tonnage REAL NOT NULL,
-    origin TEXT,
-    eta_date DATE NOT NULL,
-    status TEXT DEFAULT 'pending',
-    date_added DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
-
-  db.run(`CREATE TABLE IF NOT EXISTS warehouse_capacity (
-    id INTEGER PRIMARY KEY,
-    store TEXT NOT NULL,
-    commodity TEXT NOT NULL,
-    max_capacity REAL NOT NULL,
-    date_updated DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(store, commodity)
-  )`);
-
-  db.run(`CREATE TABLE IF NOT EXISTS collection_patterns (
-    id INTEGER PRIMARY KEY,
-    customer_name TEXT,
-    commodity TEXT,
-    store TEXT,
-    avg_mt_week REAL,
-    basis TEXT,
-    last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
-
-  db.run(`CREATE TABLE IF NOT EXISTS file_uploads (
-    id INTEGER PRIMARY KEY,
-    filename TEXT,
-    file_type TEXT,
-    batches_imported INTEGER DEFAULT 0,
-    upload_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-    status TEXT DEFAULT 'processed'
-  )`);
-});
-
-// ============ BATCH ROUTES ============
-app.get('/api/batches', (req, res) => {
-  const { store, commodity, status } = req.query;
-  let query = 'SELECT * FROM batches WHERE 1=1';
-  const params = [];
-  
-  if (store) { query += ' AND store = ?'; params.push(store); }
-  if (commodity) { query += ' AND commodity = ?'; params.push(commodity); }
-  if (status) { query += ' AND status = ?'; params.push(status); }
-  else { query += " AND status = 'in_stock'"; }
-  
-  query += ' ORDER BY date_added DESC';
-  
-  db.all(query, params, (err, rows) => {
-    res.json(rows || []);
-  });
-});
-
-app.get('/api/current-stock', (req, res) => {
-  db.all(`SELECT store, commodity, SUM(tonnage) as total_mt, COUNT(*) as batch_count
-    FROM batches WHERE status = 'in_stock'
-    GROUP BY store, commodity ORDER BY store, commodity`, (err, rows) => {
-    res.json(rows || []);
-  });
-});
-
-app.post('/api/batches', (req, res) => {
-  const { batch_id, store, commodity, tonnage, origin, vessel, spec } = req.body;
-  
-  db.run(`INSERT OR REPLACE INTO batches (batch_id, store, commodity, tonnage, origin, vessel, spec, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'in_stock')`,
-    [batch_id, store, commodity, parseFloat(tonnage), origin || '', vessel || '', spec || ''],
-    function(err) {
-      res.json({ success: true, message: 'Batch added' });
-    }
-  );
-});
-
-app.put('/api/batches/:id/remove', (req, res) => {
-  db.run(`UPDATE batches SET status = 'out', date_removed = CURRENT_TIMESTAMP WHERE id = ?`,
-    [req.params.id], function(err) {
-      res.json({ success: true, message: 'Batch marked out' });
-    }
-  );
-});
-
-app.delete('/api/batches/:id', (req, res) => {
-  db.run(`DELETE FROM batches WHERE id = ?`, [req.params.id], function(err) {
-    res.json({ success: true, message: 'Batch deleted' });
-  });
-});
-
-// ============ INCOMING VESSELS ROUTES ============
-app.get('/api/incoming-vessels', (req, res) => {
-  const { store, commodity } = req.query;
-  let query = 'SELECT * FROM incoming_vessels WHERE 1=1';
-  const params = [];
-  
-  if (store) { query += ' AND store = ?'; params.push(store); }
-  if (commodity) { query += ' AND commodity = ?'; params.push(commodity); }
-  
-  query += ' ORDER BY eta_date ASC';
-  
-  db.all(query, params, (err, rows) => {
-    res.json(rows || []);
-  });
-});
-
-app.post('/api/incoming-vessels', (req, res) => {
-  const { vessel_name, commodity, store, tonnage, origin, eta_date } = req.body;
-  
-  if (!vessel_name || !commodity || !store || !tonnage || !eta_date) {
-    return res.status(400).json({ error: 'Missing required fields' });
-  }
-  
-  db.run(`INSERT INTO incoming_vessels (vessel_name, commodity, store, tonnage, origin, eta_date, status)
-    VALUES (?, ?, ?, ?, ?, ?, 'pending')`,
-    [vessel_name, commodity, store, parseFloat(tonnage), origin || '', eta_date],
-    function(err) {
-      if (err) {
-        return res.status(500).json({ error: 'Failed to add vessel' });
-      }
-      res.json({ success: true, message: 'Vessel added', id: this.lastID });
-    }
-  );
-});
-
-app.delete('/api/incoming-vessels/:id', (req, res) => {
-  db.run(`DELETE FROM incoming_vessels WHERE id = ?`, [req.params.id], function(err) {
-    res.json({ success: true, message: 'Vessel deleted' });
-  });
-});
-
-// ============ WAREHOUSE CAPACITY ROUTES ============
-app.get('/api/warehouse-capacity', (req, res) => {
-  db.all(`SELECT * FROM warehouse_capacity ORDER BY store, commodity`, (err, rows) => {
-    res.json(rows || []);
-  });
-});
-
-app.post('/api/warehouse-capacity', (req, res) => {
-  const { store, commodity, max_capacity } = req.body;
-  
-  if (!store || !commodity || max_capacity === undefined) {
-    return res.status(400).json({ error: 'Missing required fields' });
-  }
-  
-  db.run(`INSERT OR REPLACE INTO warehouse_capacity (store, commodity, max_capacity)
-    VALUES (?, ?, ?)`,
-    [store, commodity, parseFloat(max_capacity)],
-    function(err) {
-      if (err) {
-        return res.status(500).json({ error: 'Failed to save capacity' });
-      }
-      res.json({ success: true, message: 'Capacity saved' });
-    }
-  );
-});
-
-// ============ FORECAST TIMELINE ROUTES ============
-app.get('/api/forecast-timeline', (req, res) => {
-  const { store, commodity, weeks = 12 } = req.query;
-  
-  const today = new Date();
-  const timeline = [];
-  
-  // Get current stock
-  db.all(`SELECT store, commodity, SUM(tonnage) as current_stock
-    FROM batches WHERE status = 'in_stock'
-    GROUP BY store, commodity`, (err, stocks) => {
-    
-    // Get collection patterns
-    db.all(`SELECT * FROM collection_patterns`, (err, patterns) => {
-      
-      // Get incoming vessels
-      db.all(`SELECT * FROM incoming_vessels WHERE status = 'pending'`, (err, vessels) => {
-        
-        // Get warehouse capacity
-        db.all(`SELECT * FROM warehouse_capacity`, (err, capacities) => {
-          
-          // Build timeline
-          for (let w = 0; w < parseInt(weeks); w++) {
-            const weekStart = new Date(today);
-            weekStart.setDate(weekStart.getDate() + (w * 7));
-            weekStart.setHours(0, 0, 0, 0);
-            
-            const weekEnd = new Date(weekStart);
-            weekEnd.setDate(weekEnd.getDate() + 6);
-            
-            const weekData = {
-              week: w + 1,
-              weekStart: weekStart.toISOString().split('T')[0],
-              weekEnd: weekEnd.toISOString().split('T')[0],
-              stores: {}
-            };
-            
-            // Process each store/commodity combo
-            const storeFilters = store ? [store] : ['Newport', 'Kenyon', 'Avonmouth', 'Halder', 'Garston'];
-            
-            storeFilters.forEach(s => {
-              if (!weekData.stores[s]) weekData.stores[s] = {};
-              
-              const commodityFilters = commodity ? [commodity] : ['SOYA', 'FEED WHEAT (<12%)', 'MAIZE', 'TAPIOCA', 'LUCERNE', 'SWEET POTATO', 'SOYAMEAL'];
-              
-              commodityFilters.forEach(c => {
-                const currentStockRow = stocks.find(st => st.store === s && st.commodity === c);
-                const currentStock = currentStockRow ? currentStockRow.current_stock : 0;
-                
-                const collectionRate = patterns.find(p => p.commodity === c) ? patterns.find(p => p.commodity === c).avg_mt_week : 0;
-                
-                const incomingThisWeek = (vessels || [])
-                  .filter(v => v.store === s && v.commodity === c && 
-                    new Date(v.eta_date) >= weekStart && new Date(v.eta_date) <= weekEnd)
-                  .reduce((sum, v) => sum + v.tonnage, 0);
-                
-                const capacity = capacities.find(cap => cap.store === s && cap.commodity === c) ? capacities.find(cap => cap.store === s && cap.commodity === c).max_capacity : 10000;
-                
-                weekData.stores[s][c] = {
-                  startStock: currentStock,
-                  collections: collectionRate,
-                  incoming: incomingThisWeek,
-                  endStock: Math.max(0, currentStock + incomingThisWeek - collectionRate),
-                  capacity: capacity,
-                  utilizationPercent: ((Math.max(0, currentStock + incomingThisWeek - collectionRate) / capacity) * 100).toFixed(1),
-                  stockoutRisk: (Math.max(0, currentStock + incomingThisWeek - collectionRate) < (collectionRate * 1.5))
-                };
-              });
-            });
-            
-            timeline.push(weekData);
-          }
-          
-          res.json(timeline);
-        });
-      });
-    });
-  });
-});
-
-// ============ FILE UPLOAD ============
-app.post('/api/upload-stock', upload.single('file'), (req, res) => {
-  try {
-    const filePath = req.file.path;
-    const workbook = XLSX.readFile(filePath);
-    
-    let batchesImported = 0;
-
-    // Kenyon sheet
-    if (workbook.SheetNames.includes('This Week Kenyon')) {
-      const ws = workbook.Sheets['This Week Kenyon'];
-      const data = XLSX.utils.sheet_to_json(ws);
-      data.forEach(row => {
-        if (!row.Batch || row.Balance === 0 || row.Balance === undefined) return;
-        db.run(`INSERT OR REPLACE INTO batches (batch_id, store, commodity, tonnage, origin, vessel, spec, status)
-          VALUES (?, ?, ?, ?, ?, ?, ?, 'in_stock')`,
-          [String(row.Batch), 'Kenyon', row.Commodity || '', parseFloat(row.Balance) || 0, 
-           row.Origin || '', row.Vessel || '', row.Spec || ''],
-          function(err) { if (!err) batchesImported++; }
-        );
-      });
-    }
-
-    if (workbook.SheetNames.includes('NP This Week')) {
-      const ws = workbook.Sheets['NP This Week'];
-      const data = XLSX.utils.sheet_to_json(ws);
-      data.forEach(row => {
-        if (!row.Batch || row.Weight === 0 || row.Weight === undefined) return;
-        db.run(`INSERT OR REPLACE INTO batches (batch_id, store, commodity, tonnage, origin, vessel, spec, status)
-          VALUES (?, ?, ?, ?, ?, ?, ?, 'in_stock')`,
-          [String(row.Batch), 'Newport', row.Product || '', parseFloat(row.Weight) || 0, 
-           row.Origin || '', row.Visit || '', row.SPEC || ''],
-          function(err) { if (!err) batchesImported++; }
-        );
-      });
-    }
-
-    if (workbook.SheetNames.includes('This Week AV')) {
-      const ws = workbook.Sheets['This Week AV'];
-      const data = XLSX.utils.sheet_to_json(ws);
-      data.forEach(row => {
-        if (!row.BATCH || row['TOTAL '] === 0 || row['TOTAL '] === undefined) return;
-        db.run(`INSERT OR REPLACE INTO batches (batch_id, store, commodity, tonnage, origin, vessel, spec, status)
-          VALUES (?, ?, ?, ?, ?, ?, ?, 'in_stock')`,
-          [String(row.BATCH), 'Avonmouth', row.COMMODITY || row.PRODUCT || '', parseFloat(row['TOTAL ']) || 0, 
-           row.ORIGIN || '', '', row.SPEC || ''],
-          function(err) { if (!err) batchesImported++; }
-        );
-      });
-    }
-
-    if (workbook.SheetNames.includes('This Week HA')) {
-      const ws = workbook.Sheets['This Week HA'];
-      const data = XLSX.utils.sheet_to_json(ws);
-      data.forEach(row => {
-        if (!row.BATCH || row['TOTAL '] === 0 || row['TOTAL '] === undefined) return;
-        db.run(`INSERT OR REPLACE INTO batches (batch_id, store, commodity, tonnage, origin, vessel, spec, status)
-          VALUES (?, ?, ?, ?, ?, ?, ?, 'in_stock')`,
-          [String(row.BATCH), 'Halder', row.COMMODITY || '', parseFloat(row['TOTAL ']) || 0, 
-           row.ORIGIN || '', '', row.SPEC || ''],
-          function(err) { if (!err) batchesImported++; }
-        );
-      });
-    }
-
-    if (workbook.SheetNames.includes('This Week GA')) {
-      const ws = workbook.Sheets['This Week GA'];
-      const data = XLSX.utils.sheet_to_json(ws);
-      data.forEach(row => {
-        if (!row.BATCH || row['TOTAL '] === 0 || row['TOTAL '] === undefined) return;
-        db.run(`INSERT OR REPLACE INTO batches (batch_id, store, commodity, tonnage, origin, vessel, spec, status)
-          VALUES (?, ?, ?, ?, ?, ?, ?, 'in_stock')`,
-          [String(row.BATCH), 'Garston', row.PRODUCT || '', parseFloat(row['TOTAL ']) || 0, 
-           row.ORIGIN || '', row.Vessel || '', row.SPEC || ''],
-          function(err) { if (!err) batchesImported++; }
-        );
-      });
-    }
-
-    setTimeout(() => {
-      db.run(`INSERT INTO file_uploads (filename, file_type, batches_imported) VALUES (?, ?, ?)`,
-        [req.file.filename, 'stock_sheet', batchesImported],
-        function(err) {
-          res.json({ success: true, message: `✅ ${batchesImported} batches imported`, batches_imported: batchesImported });
+// Upload Excel file
+app.post('/api/upload', upload.single('file'), (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'No file uploaded' });
         }
-      );
-    }, 1500);
 
-  } catch (error) {
-    res.status(500).json({ error: 'File processing failed', details: error.message });
-  }
-});
+        console.log(`\n📤 Processing upload: ${req.file.filename}`);
 
-// ============ COLLECTION PATTERNS ============
-app.get('/api/collection-patterns', (req, res) => {
-  db.all(`SELECT * FROM collection_patterns ORDER BY customer_name`, (err, rows) => {
-    res.json(rows || []);
-  });
-});
+        const batches = parseExcelFile(req.file.path);
 
-app.post('/api/collection-patterns', (req, res) => {
-  const { customer_name, commodity, store, avg_mt_week, basis } = req.body;
-  
-  db.run(`INSERT INTO collection_patterns (customer_name, commodity, store, avg_mt_week, basis)
-    VALUES (?, ?, ?, ?, ?)`,
-    [customer_name, commodity, store || 'All', avg_mt_week, basis || 'Observed'],
-    function(err) {
-      res.json({ success: true, message: 'Pattern saved' });
+        // Clear old batches and insert new ones
+        db.run('DELETE FROM batches', (err) => {
+            if (err) {
+                console.error('DB error clearing batches:', err);
+                return res.status(500).json({ error: 'Database error' });
+            }
+
+            // Insert new batches
+            let inserted = 0;
+            batches.forEach(batch => {
+                db.run(
+                    `INSERT INTO batches (store, batch, commodity, balance, origin, vessel, spec, uid)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [batch.store, batch.batch, batch.commodity, batch.balance, batch.origin, batch.vessel, batch.spec, batch.uid],
+                    (err) => {
+                        if (err) console.error('Insert error:', err);
+                        else inserted++;
+                    }
+                );
+            });
+
+            // Log upload
+            db.run(
+                `INSERT INTO file_uploads (filename, batch_count) VALUES (?, ?)`,
+                [req.file.filename, batches.length]
+            );
+
+            // Cleanup uploaded file
+            fs.unlink(req.file.path, (err) => {
+                if (err) console.error('File cleanup error:', err);
+            });
+
+            res.json({
+                success: true,
+                message: `Uploaded ${batches.length} batches`,
+                batch_count: batches.length
+            });
+        });
+
+    } catch (error) {
+        console.error('Upload error:', error);
+        res.status(500).json({ error: error.message });
     }
-  );
 });
 
-// ============ UTILITIES ============
-app.get('/api/uploads-history', (req, res) => {
-  db.all(`SELECT * FROM file_uploads ORDER BY upload_date DESC LIMIT 50`, (err, rows) => {
-    res.json(rows || []);
-  });
+// Get all batches (filtered - only non-zero commodities per store)
+app.get('/api/batches', (req, res) => {
+    db.all(
+        `SELECT DISTINCT 
+            store, 
+            commodity, 
+            SUM(balance) as total_balance,
+            origin
+         FROM batches 
+         WHERE balance > 0
+         GROUP BY store, commodity
+         ORDER BY store, total_balance DESC`,
+        (err, rows) => {
+            if (err) {
+                console.error('Query error:', err);
+                return res.status(500).json({ error: err.message });
+            }
+            res.json(rows || []);
+        }
+    );
 });
 
-app.get('/api/kpis', (req, res) => {
-  db.all(`SELECT store, commodity, SUM(tonnage) as total_mt FROM batches
-    WHERE status = 'in_stock' GROUP BY store, commodity`, (err, stocks) => {
-    const currentStock = (stocks || []).reduce((sum, s) => sum + (s.total_mt || 0), 0);
-    res.json({
-      currentStock: currentStock,
-      incomingMT: 0,
-      weeklyCollections: 290,
-      weekToStockout: 5
-    });
-  });
+// Get batches for timeline (with week calculations)
+app.get('/api/batches/timeline/:store', (req, res) => {
+    const { store } = req.params;
+
+    db.all(
+        `SELECT 
+            store, 
+            commodity, 
+            SUM(balance) as total_balance,
+            COUNT(DISTINCT batch) as batch_count
+         FROM batches 
+         WHERE store = ? AND balance > 0
+         GROUP BY commodity
+         ORDER BY commodity`,
+        [store],
+        (err, rows) => {
+            if (err) {
+                console.error('Query error:', err);
+                return res.status(500).json({ error: err.message });
+            }
+            res.json(rows || []);
+        }
+    );
 });
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok' });
+// Get incoming vessels
+app.get('/api/vessels', (req, res) => {
+    db.all(
+        'SELECT * FROM incoming_vessels ORDER BY eta ASC',
+        (err, rows) => {
+            if (err) {
+                console.error('Query error:', err);
+                return res.status(500).json({ error: err.message });
+            }
+            res.json(rows || []);
+        }
+    );
 });
 
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
+// Add vessel
+app.post('/api/vessels', express.json(), (req, res) => {
+    const { name, eta, commodity, tonnage, origin } = req.body;
+
+    if (!name || !eta || !commodity || !tonnage || !origin) {
+        return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    db.run(
+        `INSERT INTO incoming_vessels (name, eta, commodity, tonnage, origin) 
+         VALUES (?, ?, ?, ?, ?)`,
+        [name, eta, commodity, parseFloat(tonnage), origin],
+        function(err) {
+            if (err) {
+                console.error('Insert error:', err);
+                return res.status(500).json({ error: err.message });
+            }
+            res.json({ id: this.lastID, success: true });
+        }
+    );
 });
 
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
+// Delete vessel
+app.delete('/api/vessels/:id', (req, res) => {
+    db.run(
+        'DELETE FROM incoming_vessels WHERE id = ?',
+        [req.params.id],
+        (err) => {
+            if (err) {
+                console.error('Delete error:', err);
+                return res.status(500).json({ error: err.message });
+            }
+            res.json({ success: true });
+        }
+    );
 });
 
+// Get warehouse capacity
+app.get('/api/capacity', (req, res) => {
+    db.all(
+        'SELECT * FROM warehouse_capacity ORDER BY store, commodity ASC',
+        (err, rows) => {
+            if (err) {
+                console.error('Query error:', err);
+                return res.status(500).json({ error: err.message });
+            }
+            res.json(rows || []);
+        }
+    );
+});
+
+// Set warehouse capacity
+app.post('/api/capacity', express.json(), (req, res) => {
+    const { store, commodity, max_mt } = req.body;
+
+    if (!store || !commodity || max_mt === undefined) {
+        return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    db.run(
+        `INSERT OR REPLACE INTO warehouse_capacity (store, commodity, max_mt) 
+         VALUES (?, ?, ?)`,
+        [store, commodity, parseFloat(max_mt)],
+        function(err) {
+            if (err) {
+                console.error('Insert error:', err);
+                return res.status(500).json({ error: err.message });
+            }
+            res.json({ success: true });
+        }
+    );
+});
+
+// Delete capacity
+app.delete('/api/capacity/:id', (req, res) => {
+    db.run(
+        'DELETE FROM warehouse_capacity WHERE id = ?',
+        [req.params.id],
+        (err) => {
+            if (err) {
+                console.error('Delete error:', err);
+                return res.status(500).json({ error: err.message });
+            }
+            res.json({ success: true });
+        }
+    );
+});
+
+// Get dashboard overview
+app.get('/api/overview', (req, res) => {
+    db.all(
+        `SELECT 
+            COUNT(DISTINCT store) as store_count,
+            COUNT(DISTINCT commodity) as commodity_count,
+            SUM(balance) as total_inventory
+         FROM batches
+         WHERE balance > 0`,
+        (err, rows) => {
+            if (err) {
+                console.error('Query error:', err);
+                return res.status(500).json({ error: err.message });
+            }
+
+            const overview = rows[0] || { store_count: 0, commodity_count: 0, total_inventory: 0 };
+
+            db.all('SELECT COUNT(*) as count FROM incoming_vessels', (err, vessels) => {
+                if (err) {
+                    console.error('Query error:', err);
+                    return res.status(500).json({ error: err.message });
+                }
+
+                res.json({
+                    total_inventory: overview.total_inventory || 0,
+                    commodity_count: overview.commodity_count || 0,
+                    store_count: overview.store_count || 5,
+                    vessel_count: vessels[0]?.count || 0
+                });
+            });
+        }
+    );
+});
+
+// Serve static files
+app.use(express.static('public'));
+
+// Start server
 app.listen(PORT, () => {
-  console.log(`Running on ${PORT}`);
+    console.log(`
+╔════════════════════════════════════════╗
+║  Forecasting Dashboard Server Started  ║
+║  Port: ${PORT}                            ║
+║  Ready to process uploads              ║
+╚════════════════════════════════════════╝
+    `);
 });
