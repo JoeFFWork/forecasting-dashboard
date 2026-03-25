@@ -46,6 +46,27 @@ db.serialize(() => {
     date_removed DATETIME
   )`);
 
+  db.run(`CREATE TABLE IF NOT EXISTS incoming_vessels (
+    id INTEGER PRIMARY KEY,
+    vessel_name TEXT NOT NULL,
+    commodity TEXT NOT NULL,
+    store TEXT NOT NULL,
+    tonnage REAL NOT NULL,
+    origin TEXT,
+    eta_date DATE NOT NULL,
+    status TEXT DEFAULT 'pending',
+    date_added DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS warehouse_capacity (
+    id INTEGER PRIMARY KEY,
+    store TEXT NOT NULL,
+    commodity TEXT NOT NULL,
+    max_capacity REAL NOT NULL,
+    date_updated DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(store, commodity)
+  )`);
+
   db.run(`CREATE TABLE IF NOT EXISTS collection_patterns (
     id INTEGER PRIMARY KEY,
     customer_name TEXT,
@@ -66,11 +87,7 @@ db.serialize(() => {
   )`);
 });
 
-// Routes
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
-});
-
+// ============ BATCH ROUTES ============
 app.get('/api/batches', (req, res) => {
   const { store, commodity, status } = req.query;
   let query = 'SELECT * FROM batches WHERE 1=1';
@@ -122,6 +139,154 @@ app.delete('/api/batches/:id', (req, res) => {
   });
 });
 
+// ============ INCOMING VESSELS ROUTES ============
+app.get('/api/incoming-vessels', (req, res) => {
+  const { store, commodity } = req.query;
+  let query = 'SELECT * FROM incoming_vessels WHERE 1=1';
+  const params = [];
+  
+  if (store) { query += ' AND store = ?'; params.push(store); }
+  if (commodity) { query += ' AND commodity = ?'; params.push(commodity); }
+  
+  query += ' ORDER BY eta_date ASC';
+  
+  db.all(query, params, (err, rows) => {
+    res.json(rows || []);
+  });
+});
+
+app.post('/api/incoming-vessels', (req, res) => {
+  const { vessel_name, commodity, store, tonnage, origin, eta_date } = req.body;
+  
+  if (!vessel_name || !commodity || !store || !tonnage || !eta_date) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+  
+  db.run(`INSERT INTO incoming_vessels (vessel_name, commodity, store, tonnage, origin, eta_date, status)
+    VALUES (?, ?, ?, ?, ?, ?, 'pending')`,
+    [vessel_name, commodity, store, parseFloat(tonnage), origin || '', eta_date],
+    function(err) {
+      if (err) {
+        return res.status(500).json({ error: 'Failed to add vessel' });
+      }
+      res.json({ success: true, message: 'Vessel added', id: this.lastID });
+    }
+  );
+});
+
+app.delete('/api/incoming-vessels/:id', (req, res) => {
+  db.run(`DELETE FROM incoming_vessels WHERE id = ?`, [req.params.id], function(err) {
+    res.json({ success: true, message: 'Vessel deleted' });
+  });
+});
+
+// ============ WAREHOUSE CAPACITY ROUTES ============
+app.get('/api/warehouse-capacity', (req, res) => {
+  db.all(`SELECT * FROM warehouse_capacity ORDER BY store, commodity`, (err, rows) => {
+    res.json(rows || []);
+  });
+});
+
+app.post('/api/warehouse-capacity', (req, res) => {
+  const { store, commodity, max_capacity } = req.body;
+  
+  if (!store || !commodity || max_capacity === undefined) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+  
+  db.run(`INSERT OR REPLACE INTO warehouse_capacity (store, commodity, max_capacity)
+    VALUES (?, ?, ?)`,
+    [store, commodity, parseFloat(max_capacity)],
+    function(err) {
+      if (err) {
+        return res.status(500).json({ error: 'Failed to save capacity' });
+      }
+      res.json({ success: true, message: 'Capacity saved' });
+    }
+  );
+});
+
+// ============ FORECAST TIMELINE ROUTES ============
+app.get('/api/forecast-timeline', (req, res) => {
+  const { store, commodity, weeks = 12 } = req.query;
+  
+  const today = new Date();
+  const timeline = [];
+  
+  // Get current stock
+  db.all(`SELECT store, commodity, SUM(tonnage) as current_stock
+    FROM batches WHERE status = 'in_stock'
+    GROUP BY store, commodity`, (err, stocks) => {
+    
+    // Get collection patterns
+    db.all(`SELECT * FROM collection_patterns`, (err, patterns) => {
+      
+      // Get incoming vessels
+      db.all(`SELECT * FROM incoming_vessels WHERE status = 'pending'`, (err, vessels) => {
+        
+        // Get warehouse capacity
+        db.all(`SELECT * FROM warehouse_capacity`, (err, capacities) => {
+          
+          // Build timeline
+          for (let w = 0; w < parseInt(weeks); w++) {
+            const weekStart = new Date(today);
+            weekStart.setDate(weekStart.getDate() + (w * 7));
+            weekStart.setHours(0, 0, 0, 0);
+            
+            const weekEnd = new Date(weekStart);
+            weekEnd.setDate(weekEnd.getDate() + 6);
+            
+            const weekData = {
+              week: w + 1,
+              weekStart: weekStart.toISOString().split('T')[0],
+              weekEnd: weekEnd.toISOString().split('T')[0],
+              stores: {}
+            };
+            
+            // Process each store/commodity combo
+            const storeFilters = store ? [store] : ['Newport', 'Kenyon', 'Avonmouth', 'Halder', 'Garston'];
+            
+            storeFilters.forEach(s => {
+              if (!weekData.stores[s]) weekData.stores[s] = {};
+              
+              const commodityFilters = commodity ? [commodity] : ['SOYA', 'FEED WHEAT (<12%)', 'MAIZE', 'TAPIOCA', 'LUCERNE', 'SWEET POTATO', 'SOYAMEAL'];
+              
+              commodityFilters.forEach(c => {
+                const currentStockRow = stocks.find(st => st.store === s && st.commodity === c);
+                const currentStock = currentStockRow ? currentStockRow.current_stock : 0;
+                
+                const collectionRate = patterns.find(p => p.commodity === c) ? patterns.find(p => p.commodity === c).avg_mt_week : 0;
+                
+                const incomingThisWeek = (vessels || [])
+                  .filter(v => v.store === s && v.commodity === c && 
+                    new Date(v.eta_date) >= weekStart && new Date(v.eta_date) <= weekEnd)
+                  .reduce((sum, v) => sum + v.tonnage, 0);
+                
+                const capacity = capacities.find(cap => cap.store === s && cap.commodity === c) ? capacities.find(cap => cap.store === s && cap.commodity === c).max_capacity : 10000;
+                
+                weekData.stores[s][c] = {
+                  startStock: currentStock,
+                  collections: collectionRate,
+                  incoming: incomingThisWeek,
+                  endStock: Math.max(0, currentStock + incomingThisWeek - collectionRate),
+                  capacity: capacity,
+                  utilizationPercent: ((Math.max(0, currentStock + incomingThisWeek - collectionRate) / capacity) * 100).toFixed(1),
+                  stockoutRisk: (Math.max(0, currentStock + incomingThisWeek - collectionRate) < (collectionRate * 1.5))
+                };
+              });
+            });
+            
+            timeline.push(weekData);
+          }
+          
+          res.json(timeline);
+        });
+      });
+    });
+  });
+});
+
+// ============ FILE UPLOAD ============
 app.post('/api/upload-stock', upload.single('file'), (req, res) => {
   try {
     const filePath = req.file.path;
@@ -144,7 +309,6 @@ app.post('/api/upload-stock', upload.single('file'), (req, res) => {
       });
     }
 
-    // Newport sheet (NP This Week)
     if (workbook.SheetNames.includes('NP This Week')) {
       const ws = workbook.Sheets['NP This Week'];
       const data = XLSX.utils.sheet_to_json(ws);
@@ -159,7 +323,6 @@ app.post('/api/upload-stock', upload.single('file'), (req, res) => {
       });
     }
 
-    // Avonmouth sheet - USES COMMODITY COLUMN
     if (workbook.SheetNames.includes('This Week AV')) {
       const ws = workbook.Sheets['This Week AV'];
       const data = XLSX.utils.sheet_to_json(ws);
@@ -174,7 +337,6 @@ app.post('/api/upload-stock', upload.single('file'), (req, res) => {
       });
     }
 
-    // Halder sheet - USES COMMODITY COLUMN
     if (workbook.SheetNames.includes('This Week HA')) {
       const ws = workbook.Sheets['This Week HA'];
       const data = XLSX.utils.sheet_to_json(ws);
@@ -189,7 +351,6 @@ app.post('/api/upload-stock', upload.single('file'), (req, res) => {
       });
     }
 
-    // Garston sheet - USES PRODUCT COLUMN
     if (workbook.SheetNames.includes('This Week GA')) {
       const ws = workbook.Sheets['This Week GA'];
       const data = XLSX.utils.sheet_to_json(ws);
@@ -218,6 +379,7 @@ app.post('/api/upload-stock', upload.single('file'), (req, res) => {
   }
 });
 
+// ============ COLLECTION PATTERNS ============
 app.get('/api/collection-patterns', (req, res) => {
   db.all(`SELECT * FROM collection_patterns ORDER BY customer_name`, (err, rows) => {
     res.json(rows || []);
@@ -236,6 +398,7 @@ app.post('/api/collection-patterns', (req, res) => {
   );
 });
 
+// ============ UTILITIES ============
 app.get('/api/uploads-history', (req, res) => {
   db.all(`SELECT * FROM file_uploads ORDER BY upload_date DESC LIMIT 50`, (err, rows) => {
     res.json(rows || []);
@@ -257,6 +420,10 @@ app.get('/api/kpis', (req, res) => {
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
+});
+
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
 });
 
 app.get('*', (req, res) => {
