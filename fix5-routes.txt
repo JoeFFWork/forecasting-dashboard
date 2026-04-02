@@ -1,0 +1,345 @@
+// ═════════════════════════════════════════════════════════════════════════════
+// Fix 5 — Route files
+// Split into five files exactly as shown below.
+// Each section shows the target file path and its complete content.
+// ═════════════════════════════════════════════════════════════════════════════
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FILE: app/api/imports/upload/route.ts
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { NextRequest, NextResponse } from 'next/server'
+import { PrismaClient } from '@prisma/client'
+
+const prisma = new PrismaClient()
+
+export async function POST(req: NextRequest) {
+  const formData   = await req.formData()
+  const file       = formData.get('file')       as File   | null
+  const templateId = formData.get('templateId') as string | null
+
+  if (!file)       return NextResponse.json({ error: 'file is required' },       { status: 400 })
+  if (!templateId) return NextResponse.json({ error: 'templateId is required' }, { status: 400 })
+
+  const tid = parseInt(templateId, 10)
+  if (isNaN(tid)) return NextResponse.json({ error: 'templateId must be a number' }, { status: 400 })
+
+  const template = await prisma.importTemplate.findUnique({ where: { id: tid } })
+  if (!template || !template.isActive) {
+    return NextResponse.json({ error: 'Template not found or inactive' }, { status: 404 })
+  }
+
+  const extension = file.name.split('.').pop()?.toLowerCase() ?? ''
+  if (extension !== template.fileType) {
+    return NextResponse.json({
+      error: `File type mismatch: template expects "${template.fileType}", uploaded file is ".${extension}"`,
+    }, { status: 400 })
+  }
+
+  const session = await prisma.importSession.create({
+    data: {
+      templateId: template.id,
+      filename:   file.name,
+      fileType:   template.fileType,
+      status:     'PENDING',
+    },
+    select: { id: true },
+  })
+
+  return NextResponse.json({ sessionId: session.id }, { status: 201 })
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FILE: app/api/imports/sessions/[id]/route.ts
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { NextRequest, NextResponse } from 'next/server'
+import { PrismaClient } from '@prisma/client'
+
+const prisma = new PrismaClient()
+
+export async function GET(
+  _req: NextRequest,
+  { params }: { params: { id: string } },
+) {
+  const session = await prisma.importSession.findUnique({
+    where:  { id: parseInt(params.id, 10) },
+    select: {
+      id:           true,
+      status:       true,
+      filename:     true,
+      fileType:     true,
+      rowsTotal:    true,
+      rowsImported: true,
+      rowsSkipped:  true,
+      rowsErrored:  true,
+      startedAt:    true,
+      completedAt:  true,
+      template:     { select: { name: true, targetEntity: true } },
+    },
+  })
+  if (!session) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  return NextResponse.json(session)
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FILE: app/api/imports/sessions/[id]/run/route.ts
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { NextRequest, NextResponse } from 'next/server'
+import { PrismaClient } from '@prisma/client'
+import { runFile2 } from '@/lib/import/file2/salesContractFlow'
+import type { File2MappedRow, File2ResolvedIds } from '@/lib/import/file2/types'
+
+const prisma = new PrismaClient()
+
+export async function POST(
+  req: NextRequest,
+  { params }: { params: { id: string } },
+) {
+  const sessionId = parseInt(params.id, 10)
+  if (isNaN(sessionId)) return NextResponse.json({ error: 'Invalid session id' }, { status: 400 })
+
+  const session = await prisma.importSession.findUnique({
+    where:   { id: sessionId },
+    include: { template: { select: { targetEntity: true, fileType: true } } },
+  })
+  if (!session) return NextResponse.json({ error: 'Session not found' }, { status: 404 })
+  if (session.status !== 'PENDING') {
+    return NextResponse.json({ error: `Session is ${session.status}; expected PENDING` }, { status: 409 })
+  }
+  if (session.template?.targetEntity !== 'sales_contracts') {
+    return NextResponse.json({ error: 'This route only handles sales_contracts sessions' }, { status: 400 })
+  }
+
+  const formData = await req.formData()
+  const file     = formData.get('file') as File | null
+  if (!file) return NextResponse.json({ error: 'file is required' }, { status: 400 })
+
+  const buffer = Buffer.from(await file.arrayBuffer())
+  const result = await runFile2(sessionId, buffer)
+
+  // Build preview from first 50 rows
+  const preview = result.rows.slice(0, 50).map(row => ({
+    rowNumber:    row.rowNumber,
+    status:       row.outcome,
+    errors:       row.errors,
+    skippedReason: row.skippedReason ?? null,
+    contractRef:  row.mappedData.contractRef,
+    customer: {
+      resolvedId:   row.resolvedIds.customerId,
+      resolvedName: row.resolvedIds.customerMatchedBy === 'created'
+        ? row.mappedData._customerName
+        : row.mappedData._customerName,
+      created:      row.resolvedIds.customerCreated,
+      reviewFlag:   row.resolvedIds.customerReviewFlag,
+      matchedBy:    row.resolvedIds.customerMatchedBy,
+    },
+    commodity: {
+      resolvedId:   row.resolvedIds.commodityId,
+      resolvedName: row.resolvedIds.resolvedCommodityName,
+      error:        row.errors.find(e => e.includes('commodity')) ?? null,
+    },
+    qty: {
+      rawContractQtyFile2:    row.mappedData.rawContractQtyFile2?.toString() ?? null,
+      derivedReleaseSumFile1: null,
+      effectiveContractQty:   row.mappedData.rawContractQtyFile2?.toString() ?? '0',
+      qtySource:              'File2',
+      qtyReviewFlag:          row.mappedData.rawContractQtyFile2 === null && row.outcome === 'pending',
+      qtyReviewNote:          row.mappedData.rawContractQtyFile2 === null && row.outcome === 'pending'
+        ? `Contract ${row.mappedData.contractRef}: quantity absent from File 2`
+        : null,
+    },
+    location: {
+      rawSourceLocation:        row.resolvedIds.rawSourceLocation,
+      canonicalStoredLocation:  row.resolvedIds.canonicalStoredLocation,
+      groupedReportingLocation: row.resolvedIds.groupedReportingLocation,
+      note:                     row.resolvedIds.locationNote,
+    },
+    price:             row.mappedData.price?.toString() ?? null,
+    currency:          row.mappedData.currency ?? null,
+    contractDate:      row.mappedData.contractDate?.toISOString() ?? null,
+    contractStartDate: row.mappedData.contractStartDate?.toISOString() ?? null,
+    contractEndDate:   row.mappedData.contractEndDate?.toISOString() ?? null,
+    customerContractRef: row.mappedData.customerContractRef,
+    deliveryTerms:       row.mappedData.deliveryTerms,
+    settledTonnes:       row.mappedData.settledTonnes?.toString() ?? null,
+    unshippedTonnes:     row.mappedData.unshippedTonnes?.toString() ?? null,
+  }))
+
+  return NextResponse.json({
+    sessionId:         result.sessionId,
+    filename:          session.filename,
+    templateName:      session.template?.targetEntity ?? '',
+    rowsTotal:         result.rowsTotal,
+    rowsPending:       result.rowsPending,
+    rowsSkipped:       result.rowsSkipped,
+    rowsError:         result.rowsError,
+    resolutionSummary: result.resolutionSummary,
+    preview,
+  })
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FILE: app/api/imports/sessions/[id]/commit/route.ts
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { NextRequest, NextResponse } from 'next/server'
+import { PrismaClient } from '@prisma/client'
+import { commitFile2 } from '@/lib/import/file2/salesContractFlow'
+
+const prisma = new PrismaClient()
+
+export async function POST(
+  _req: NextRequest,
+  { params }: { params: { id: string } },
+) {
+  const sessionId = parseInt(params.id, 10)
+  if (isNaN(sessionId)) return NextResponse.json({ error: 'Invalid session id' }, { status: 400 })
+
+  const session = await prisma.importSession.findUnique({
+    where:   { id: sessionId },
+    include: { template: { select: { targetEntity: true } } },
+  })
+  if (!session) return NextResponse.json({ error: 'Session not found' }, { status: 404 })
+
+  if (session.status === 'COMPLETED' || session.status === 'COMPLETED_WITH_ERRORS') {
+    return NextResponse.json({ error: 'Session already committed. Create a new session to re-import.' }, { status: 409 })
+  }
+  if (session.status === 'IN_PROGRESS') {
+    return NextResponse.json({ error: 'Session is already committing.' }, { status: 409 })
+  }
+  if (session.template?.targetEntity !== 'sales_contracts') {
+    return NextResponse.json({ error: 'This route only handles sales_contracts sessions' }, { status: 400 })
+  }
+
+  const rowCount = await prisma.importRow.count({ where: { importSessionId: sessionId } })
+  if (rowCount === 0) {
+    return NextResponse.json({ error: 'Session has not been run yet. Call /run before /commit.' }, { status: 409 })
+  }
+
+  const result = await commitFile2(sessionId)
+
+  const finalSession = await prisma.importSession.findUniqueOrThrow({
+    where:  { id: sessionId },
+    select: { status: true, completedAt: true, rowsImported: true, rowsSkipped: true, rowsErrored: true },
+  })
+
+  // Count alerts generated in this pass
+  const [qtyAlerts, customerAlerts] = await Promise.all([
+    prisma.alert.count({ where: { category: 'contract_qty_review',   entityType: 'sales_contract' } }),
+    prisma.alert.count({ where: { category: 'customer_auto_created', entityType: 'customer'       } }),
+  ])
+
+  return NextResponse.json({
+    sessionId,
+    status:       finalSession.status,
+    rowsTotal:    session.rowsTotal ?? 0,
+    rowsImported: finalSession.rowsImported ?? 0,
+    rowsCreated:  result.rowsCreated,
+    rowsUpdated:  result.rowsUpdated,
+    rowsSkipped:  finalSession.rowsSkipped ?? 0,
+    rowsErrored:  finalSession.rowsErrored ?? 0,
+    reviewFlags: {
+      qtyReviewFlagged:       qtyAlerts,
+      customersAutoCreated:   customerAlerts,
+      customersReviewFlagged: customerAlerts,
+    },
+    alertsRaised: {
+      contractQtyReview:   qtyAlerts,
+      customerAutoCreated: customerAlerts,
+    },
+    dbErrors:     result.dbErrors,
+    completedAt:  finalSession.completedAt?.toISOString() ?? new Date().toISOString(),
+  })
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FILE: app/api/imports/sessions/[id]/rows/route.ts
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { NextRequest, NextResponse } from 'next/server'
+import { PrismaClient } from '@prisma/client'
+import type { File2MappedRow, File2ResolvedIds } from '@/lib/import/file2/types'
+
+const prisma = new PrismaClient()
+
+export async function GET(
+  req: NextRequest,
+  { params }: { params: { id: string } },
+) {
+  const sessionId    = parseInt(params.id, 10)
+  const url          = req.nextUrl
+  const statusFilter = url.searchParams.get('status') ?? undefined
+  const page         = Math.max(1, parseInt(url.searchParams.get('page')     ?? '1',  10))
+  const pageSize     = Math.min(200, parseInt(url.searchParams.get('pageSize') ?? '50', 10))
+
+  const where = {
+    importSessionId: sessionId,
+    ...(statusFilter ? { status: statusFilter } : {}),
+  }
+
+  const [total, rows] = await Promise.all([
+    prisma.importRow.count({ where }),
+    prisma.importRow.findMany({
+      where,
+      orderBy: { rowNumber: 'asc' },
+      skip:    (page - 1) * pageSize,
+      take:    pageSize,
+      select:  {
+        rowNumber:    true,
+        status:       true,
+        rawData:      true,
+        mappedData:   true,
+        resolvedIds:  true,
+        errorMessage: true,
+        skippedReason: true,
+      },
+    }),
+  ])
+
+  const previewRows = rows.map(r => {
+    const mapped   = r.mappedData  as unknown as File2MappedRow
+    const resolved = r.resolvedIds as unknown as File2ResolvedIds
+    return {
+      rowNumber:    r.rowNumber,
+      status:       r.status,
+      errors:       r.errorMessage ? [r.errorMessage] : [],
+      skippedReason: r.skippedReason ?? null,
+      contractRef:  mapped.contractRef,
+      customer: {
+        resolvedId:   resolved.customerId,
+        resolvedName: mapped._customerName,
+        created:      resolved.customerCreated,
+        reviewFlag:   resolved.customerReviewFlag,
+        matchedBy:    resolved.customerMatchedBy ?? null,
+      },
+      commodity: {
+        resolvedId:   resolved.commodityId,
+        resolvedName: resolved.resolvedCommodityName ?? null,
+        error:        r.errorMessage?.includes('commodity') ? r.errorMessage : null,
+      },
+      qty: {
+        rawContractQtyFile2:    mapped.rawContractQtyFile2?.toString() ?? null,
+        derivedReleaseSumFile1: null,
+        effectiveContractQty:   mapped.rawContractQtyFile2?.toString() ?? '0',
+        qtySource:              'File2',
+        qtyReviewFlag:          mapped.rawContractQtyFile2 === null && r.status !== 'error',
+        qtyReviewNote:          null,
+      },
+      location: {
+        rawSourceLocation:        resolved.rawSourceLocation,
+        canonicalStoredLocation:  resolved.canonicalStoredLocation,
+        groupedReportingLocation: resolved.groupedReportingLocation,
+        note:                     resolved.locationNote,
+      },
+    }
+  })
+
+  return NextResponse.json({ sessionId, page, pageSize, total, rows: previewRows })
+}

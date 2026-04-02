@@ -1,0 +1,471 @@
+// lib/import/file2/salesContractFlow.ts
+// Fix 4 applied:
+//   - resolvedCommodityName and customerMatchedBy now written in resolveRow()
+//   - resolutionSummary computed in runFile2() and returned in RunResult
+//   - default resolved object updated to include the two new fields
+
+import * as XLSX from 'xlsx'
+import { PrismaClient, ContractStatus } from '@prisma/client'
+import { Prisma } from '@prisma/client'
+
+import {
+  resolveCommodity,
+  resolveCustomer,
+  resolveLocation,
+} from '../resolvers'
+import {
+  validateContractRow,
+  findInFileDuplicates,
+} from './contractValidator'
+import {
+  toDecimal,
+  toDate,
+  toCurrency,
+  toStr,
+  extractAccountCode,
+  extractCustomerContractRef,
+} from '../utils'
+import type {
+  File2RawRow,
+  File2MappedRow,
+  File2ResolvedIds,
+  File2CommitPayload,
+  ProcessedRow,
+  RunResult,
+  CommitResult,
+} from './types'
+
+const prisma = new PrismaClient()
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PARSE
+// ─────────────────────────────────────────────────────────────────────────────
+
+function parseFile2(buffer: Buffer): File2RawRow[] {
+  const workbook  = XLSX.read(buffer, { type: 'buffer', cellDates: true })
+  const sheetName = workbook.SheetNames[0]
+  const ws        = workbook.Sheets[sheetName]
+  return XLSX.utils.sheet_to_json<File2RawRow>(ws, { defval: null, raw: false })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAP
+// ─────────────────────────────────────────────────────────────────────────────
+
+function mapRow(raw: File2RawRow): File2MappedRow {
+  return {
+    contractRef:         toStr(raw['Contract No']),
+    contractDate:        toDate(raw['Contract Date']),
+    contractStartDate:   toDate(raw['Start Date']),
+    contractEndDate:     toDate(raw['End Date']),
+    _customerName:       toStr(raw['Customer']),
+    _accountCode:        extractAccountCode(raw as Record<string, unknown>),
+    _commodityName:      toStr(raw['Commodity']),
+    rawContractQtyFile2: toDecimal(raw['Quantity']),
+    price:               toDecimal(raw['Price']),
+    currency:            toCurrency(raw['Currency']),
+    customerContractRef: extractCustomerContractRef(raw as Record<string, unknown>),
+    deliveryTerms:       toStr(raw['Delivery Terms']),
+    rawSourceLocation:   toStr(raw['Location']),
+    settledTonnes:       toDecimal(raw['Settled']),
+    unshippedTonnes:     toDecimal(raw['Unshipped']),
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RESOLVE
+// FIX 4: resolvedCommodityName and customerMatchedBy now written to resolved object.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function resolveRow(mapped: File2MappedRow): Promise<{
+  resolved: File2ResolvedIds
+  errors:   string[]
+}> {
+  const errors: string[] = []
+
+  const commodityResult = await resolveCommodity(mapped._commodityName)
+  if (commodityResult.error) errors.push(commodityResult.error)
+
+  const customerResult  = await resolveCustomer(mapped._customerName, mapped._accountCode)
+  const locationResult  = await resolveLocation(mapped.rawSourceLocation, 'SALES')
+
+  const resolved: File2ResolvedIds = {
+    commodityId:              commodityResult.commodityId ?? null,
+    resolvedCommodityName:    commodityResult.resolvedName ?? null,    // FIX 4
+    customerId:               customerResult.customerId,
+    customerCreated:          customerResult.customerCreated,
+    customerReviewFlag:       customerResult.customerReviewFlag,
+    customerMatchedBy:        customerResult.customerMatchedBy ?? null, // FIX 4
+    rawSourceLocation:        locationResult.rawSourceLocation,
+    canonicalStoredLocation:  locationResult.canonicalStoredLocation,
+    groupedReportingLocation: locationResult.groupedReportingLocation,
+    locationNote:             locationResult.locationNote,
+  }
+
+  return { resolved, errors }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QUANTITY LOGIC
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface QtyFields {
+  rawContractQtyFile2:    Prisma.Decimal | null
+  derivedReleaseSumFile1: null
+  effectiveContractQty:   Prisma.Decimal
+  qtySource:              string
+  qtyReviewFlag:          boolean
+  qtyReviewNote:          string | null
+}
+
+function buildQtyFields(rawQty: Prisma.Decimal | null, contractRef: string): QtyFields {
+  if (rawQty !== null) {
+    return {
+      rawContractQtyFile2:    rawQty,
+      derivedReleaseSumFile1: null,
+      effectiveContractQty:   rawQty,
+      qtySource:              'File2',
+      qtyReviewFlag:          false,
+      qtyReviewNote:          null,
+    }
+  }
+  return {
+    rawContractQtyFile2:    null,
+    derivedReleaseSumFile1: null,
+    effectiveContractQty:   new Prisma.Decimal(0),
+    qtySource:              'File2',
+    qtyReviewFlag:          true,
+    qtyReviewNote:          `Contract ${contractRef}: quantity absent from File 2. effectiveContractQty set to 0. Pending manual entry or File 1 release sum derivation.`,
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BUILD COMMIT PAYLOAD
+// ─────────────────────────────────────────────────────────────────────────────
+
+function buildPayload(
+  mapped:    File2MappedRow,
+  resolved:  File2ResolvedIds,
+  sessionId: number,
+): File2CommitPayload {
+  const qty = buildQtyFields(mapped.rawContractQtyFile2, mapped.contractRef ?? 'UNKNOWN')
+  return {
+    customerId:               resolved.customerId!,
+    commodityId:              resolved.commodityId!,
+    rawSourceLocation:        resolved.rawSourceLocation,
+    canonicalStoredLocation:  resolved.canonicalStoredLocation,
+    groupedReportingLocation: resolved.groupedReportingLocation,
+    contractRef:              mapped.contractRef!.trim(),
+    contractDate:             mapped.contractDate,
+    contractStartDate:        mapped.contractStartDate,
+    contractEndDate:          mapped.contractEndDate,
+    ...qty,
+    price:                    mapped.price,
+    currency:                 mapped.currency,
+    customerContractRef:      mapped.customerContractRef,
+    deliveryTerms:            mapped.deliveryTerms,
+    status:                   ContractStatus.ACTIVE,
+    settledTonnes:            mapped.settledTonnes,
+    unshippedTonnes:          mapped.unshippedTonnes,
+    importSessionId:          sessionId,
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WRITE IMPORT ROWS
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function writeImportRows(sessionId: number, rows: ProcessedRow[]): Promise<void> {
+  const CHUNK = 100
+  for (let i = 0; i < rows.length; i += CHUNK) {
+    const chunk = rows.slice(i, i + CHUNK)
+    await prisma.$transaction(
+      chunk.map(row =>
+        prisma.importRow.create({
+          data: {
+            importSessionId: sessionId,
+            rowNumber:       row.rowNumber,
+            rawData:         row.rawData     as object,
+            mappedData:      row.mappedData  as object,
+            resolvedIds:     row.resolvedIds as object,
+            status:          row.outcome,
+            errorMessage:    row.errors.length > 0 ? row.errors.join('; ') : null,
+            skippedReason:   row.skippedReason ?? null,
+          },
+        })
+      )
+    )
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RUN — entry point 1
+// FIX 4: resolutionSummary computed from processed rows and returned.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function runFile2(sessionId: number, buffer: Buffer): Promise<RunResult> {
+  const rawRows = parseFile2(buffer)
+
+  await prisma.importSession.update({
+    where: { id: sessionId },
+    data:  { rowsTotal: rawRows.length },
+  })
+
+  const mappedRows   = rawRows.map(mapRow)
+  const inFileDupes  = findInFileDuplicates(mappedRows)
+  const processed: ProcessedRow[] = []
+
+  for (let i = 0; i < rawRows.length; i++) {
+    const rowNumber = i + 1
+    const raw       = rawRows[i]
+    const mapped    = mappedRows[i]
+    const errors:   string[] = []
+
+    const validation = validateContractRow(mapped)
+    errors.push(...validation.errors)
+
+    const ref = mapped.contractRef?.trim()
+    if (ref && inFileDupes.has(ref)) {
+      const alreadySeen = processed.some(
+        p => p.outcome !== 'skipped' && p.mappedData.contractRef?.trim() === ref
+      )
+      if (alreadySeen) {
+        errors.push(`Duplicate contractRef "${ref}" within import file — skipping later occurrence`)
+      }
+    }
+
+    // FIX 4: default resolved object includes the two new fields
+    let resolved: File2ResolvedIds = {
+      commodityId:              null,
+      resolvedCommodityName:    null,   // FIX 4
+      customerId:               null,
+      customerCreated:          false,
+      customerReviewFlag:       false,
+      customerMatchedBy:        null,   // FIX 4
+      rawSourceLocation:        null,
+      canonicalStoredLocation:  null,
+      groupedReportingLocation: null,
+      locationNote:             null,
+    }
+
+    if (errors.length === 0) {
+      const resolveResult = await resolveRow(mapped)
+      resolved = resolveResult.resolved
+      errors.push(...resolveResult.errors)
+    }
+
+    const outcome: 'pending' | 'error' = errors.length === 0 ? 'pending' : 'error'
+    processed.push({ rowNumber, outcome, rawData: raw, mappedData: mapped, resolvedIds: resolved, errors })
+  }
+
+  await writeImportRows(sessionId, processed)
+
+  // FIX 4: compute resolutionSummary across all rows
+  const resolutionSummary = {
+    commoditiesUnresolved:  processed.filter(
+      r => r.errors.some(e => e.toLowerCase().includes('commodity'))
+    ).length,
+    customersAutoCreated:   processed.filter(
+      r => r.resolvedIds.customerCreated
+    ).length,
+    customersReviewFlagged: processed.filter(
+      r => r.resolvedIds.customerReviewFlag
+    ).length,
+    locationsRemapped:      processed.filter(
+      r => r.outcome === 'pending' && r.resolvedIds.locationNote !== null
+    ).length,
+    locationsHistorical:    processed.filter(
+      r => r.resolvedIds.groupedReportingLocation === 'Historical'
+    ).length,
+    qtyReviewFlagged:       processed.filter(
+      r => r.outcome === 'pending' && r.mappedData.rawContractQtyFile2 === null
+    ).length,
+  }
+
+  return {
+    sessionId,
+    rowsTotal:         rawRows.length,
+    rowsPending:       processed.filter(r => r.outcome === 'pending').length,
+    rowsSkipped:       processed.filter(r => r.outcome === 'skipped').length,
+    rowsError:         processed.filter(r => r.outcome === 'error').length,
+    resolutionSummary, // FIX 4
+    rows:              processed,
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COMMIT — entry point 2
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function commitFile2(sessionId: number): Promise<CommitResult> {
+  await prisma.importSession.update({
+    where: { id: sessionId },
+    data:  { status: 'IN_PROGRESS', startedAt: new Date() },
+  })
+
+  const pendingRows = await prisma.importRow.findMany({
+    where: { importSessionId: sessionId, status: 'pending' },
+  })
+
+  let rowsCreated = 0
+  let rowsUpdated = 0
+  let rowsErrored = 0
+  const dbErrors: { contractRef: string; message: string }[] = []
+
+  for (const importRow of pendingRows) {
+    const mapped   = importRow.mappedData  as unknown as File2MappedRow
+    const resolved = importRow.resolvedIds as unknown as File2ResolvedIds
+
+    if (!resolved.commodityId) {
+      await prisma.importRow.update({
+        where: { id: importRow.id },
+        data:  { status: 'error', errorMessage: 'commodityId missing at commit time — unexpected state' },
+      })
+      rowsErrored++
+      continue
+    }
+
+    const payload = buildPayload(mapped, resolved, sessionId)
+
+    try {
+      const existing = await prisma.salesContract.findUnique({
+        where:  { contractRef: payload.contractRef },
+        select: { id: true },
+      })
+
+      await prisma.salesContract.upsert({
+        where:  { contractRef: payload.contractRef },
+        create: {
+          contractRef:              payload.contractRef,
+          customerId:               payload.customerId,
+          commodityId:              payload.commodityId,
+          contractDate:             payload.contractDate,
+          contractStartDate:        payload.contractStartDate,
+          contractEndDate:          payload.contractEndDate,
+          rawContractQtyFile2:      payload.rawContractQtyFile2,
+          derivedReleaseSumFile1:   payload.derivedReleaseSumFile1,
+          effectiveContractQty:     payload.effectiveContractQty,
+          qtySource:                payload.qtySource,
+          qtyReviewFlag:            payload.qtyReviewFlag,
+          qtyReviewNote:            payload.qtyReviewNote,
+          price:                    payload.price,
+          currency:                 payload.currency,
+          customerContractRef:      payload.customerContractRef,
+          deliveryTerms:            payload.deliveryTerms,
+          status:                   payload.status,
+          rawSourceLocation:        payload.rawSourceLocation,
+          canonicalStoredLocation:  payload.canonicalStoredLocation,
+          groupedReportingLocation: payload.groupedReportingLocation,
+          settledTonnes:            payload.settledTonnes,
+          unshippedTonnes:          payload.unshippedTonnes,
+          importSessionId:          payload.importSessionId,
+        },
+        update: {
+          // derivedReleaseSumFile1 intentionally excluded — owned by File1 pass.
+          customerId:               payload.customerId,
+          commodityId:              payload.commodityId,
+          contractDate:             payload.contractDate,
+          contractStartDate:        payload.contractStartDate,
+          contractEndDate:          payload.contractEndDate,
+          rawContractQtyFile2:      payload.rawContractQtyFile2,
+          effectiveContractQty:     payload.effectiveContractQty,
+          qtySource:                payload.qtySource,
+          qtyReviewFlag:            payload.qtyReviewFlag,
+          qtyReviewNote:            payload.qtyReviewNote,
+          price:                    payload.price,
+          currency:                 payload.currency,
+          customerContractRef:      payload.customerContractRef,
+          deliveryTerms:            payload.deliveryTerms,
+          rawSourceLocation:        payload.rawSourceLocation,
+          canonicalStoredLocation:  payload.canonicalStoredLocation,
+          groupedReportingLocation: payload.groupedReportingLocation,
+          settledTonnes:            payload.settledTonnes,
+          unshippedTonnes:          payload.unshippedTonnes,
+          importSessionId:          payload.importSessionId,
+        },
+      })
+
+      await prisma.importRow.update({
+        where: { id: importRow.id },
+        data:  { status: 'imported' },
+      })
+
+      existing ? rowsUpdated++ : rowsCreated++
+
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      await prisma.importRow.update({
+        where: { id: importRow.id },
+        data:  { status: 'error', errorMessage: `DB write failed: ${msg}` },
+      })
+      dbErrors.push({ contractRef: payload.contractRef, message: msg })
+      rowsErrored++
+    }
+  }
+
+  await generatePostCommitAlerts(sessionId)
+
+  const totalError   = await prisma.importRow.count({ where: { importSessionId: sessionId, status: 'error'   } })
+  const totalSkipped = await prisma.importRow.count({ where: { importSessionId: sessionId, status: 'skipped' } })
+
+  await prisma.importSession.update({
+    where: { id: sessionId },
+    data: {
+      status:       totalError > 0 ? 'COMPLETED_WITH_ERRORS' : 'COMPLETED',
+      rowsImported: rowsCreated + rowsUpdated,
+      rowsSkipped:  totalSkipped,
+      rowsErrored:  totalError,
+      completedAt:  new Date(),
+    },
+  })
+
+  return { sessionId, rowsCreated, rowsUpdated, rowsErrored, dbErrors }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST-COMMIT ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function generatePostCommitAlerts(sessionId: number): Promise<void> {
+  // 1. Quantity review flags
+  const qtyFlagged = await prisma.salesContract.findMany({
+    where:  { importSessionId: sessionId, qtyReviewFlag: true },
+    select: { id: true, contractRef: true, qtyReviewNote: true },
+  })
+  if (qtyFlagged.length > 0) {
+    await prisma.alert.createMany({
+      data: qtyFlagged.map(c => ({
+        severity:   'WARNING' as const,
+        status:     'OPEN'    as const,
+        category:   'contract_qty_review',
+        entityType: 'sales_contract',
+        entityId:   c.id,
+        title:      `${c.contractRef} — contract quantity needs review`,
+        body:       c.qtyReviewNote ?? 'Quantity missing from File 2.',
+      })),
+      skipDuplicates: true,
+    })
+  }
+
+  // 2. Auto-created customers
+  const autoCreatedRows = await prisma.importRow.findMany({
+    where:  { importSessionId: sessionId, status: 'imported' },
+    select: { resolvedIds: true, mappedData: true },
+  })
+  for (const row of autoCreatedRows) {
+    const resolved = row.resolvedIds as unknown as File2ResolvedIds
+    if (!resolved.customerCreated) continue
+    const mapped   = row.mappedData  as unknown as File2MappedRow
+    await prisma.alert.create({
+      data: {
+        severity:   'INFO',
+        status:     'OPEN',
+        category:   'customer_auto_created',
+        entityType: 'customer',
+        entityId:   resolved.customerId!,
+        title:      `New customer auto-created: "${mapped._customerName}"`,
+        body:       `Created during File 2 import (session ${sessionId}). Review canonical name and account code.`,
+      },
+    })
+  }
+}

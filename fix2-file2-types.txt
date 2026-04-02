@@ -1,0 +1,143 @@
+// lib/import/file2/types.ts
+// Fix 2 applied: added resolvedCommodityName and customerMatchedBy to File2ResolvedIds.
+// Fix 4 partial: added resolutionSummary to RunResult.
+
+import type { ContractStatus, Currency, GroupedReportingLocation } from '@prisma/client'
+import type { Prisma } from '@prisma/client'
+
+// ── Raw row as SheetJS parses it from File2 ───────────────────────────────────
+export interface File2RawRow {
+  'Contract No':        string | null
+  'Contract Date':      string | Date | null
+  'Start Date':         string | Date | null
+  'End Date':           string | Date | null
+  'Customer':           string | null
+  'Account Code'?:      string | null
+  'Id'?:                string | null
+  'Commodity':          string | null
+  'Quantity':           number | string | null
+  'Price':              number | string | null
+  'Currency':           string | null
+  'Cust Contract Ref'?: string | null
+  'PO'?:                string | null
+  'Delivery Terms'?:    string | null
+  'Location'?:          string | null
+  'Settled'?:           number | string | null
+  'Unshipped'?:         number | string | null
+  [key: string]: unknown
+}
+
+// ── Mapped row — schema field names, typed values ─────────────────────────────
+export interface File2MappedRow {
+  contractRef:           string | null
+  contractDate:          Date | null
+  contractStartDate:     Date | null
+  contractEndDate:       Date | null
+  _customerName:         string | null
+  _accountCode:          string | null
+  _commodityName:        string | null
+  rawContractQtyFile2:   Prisma.Decimal | null
+  price:                 Prisma.Decimal | null
+  currency:              Currency | null
+  customerContractRef:   string | null
+  deliveryTerms:         string | null
+  rawSourceLocation:     string | null
+  settledTonnes:         Prisma.Decimal | null
+  unshippedTonnes:       Prisma.Decimal | null
+}
+
+// ── Resolved IDs — written to ImportRow.resolvedIds ──────────────────────────
+// FIX 2: resolvedCommodityName and customerMatchedBy added.
+export interface File2ResolvedIds {
+  commodityId:              number | null
+  resolvedCommodityName:    string | null   // FIX 2: canonical name e.g. "Soya"
+  customerId:               number | null
+  customerCreated:          boolean
+  customerReviewFlag:       boolean
+  customerMatchedBy:        // FIX 2: how the customer was resolved
+    | 'ff_straights'
+    | 'ff_mills'
+    | 'alias'
+    | 'exact'
+    | 'loose'
+    | 'created'
+    | null
+  rawSourceLocation:        string | null
+  canonicalStoredLocation:  string | null
+  groupedReportingLocation: GroupedReportingLocation | null
+  locationNote:             string | null
+}
+
+// ── Validation result ─────────────────────────────────────────────────────────
+export interface ValidationResult {
+  valid:  boolean
+  errors: string[]
+}
+
+// ── Commit payload — one per pending ImportRow ────────────────────────────────
+export interface File2CommitPayload {
+  customerId:               number
+  commodityId:              number
+  rawSourceLocation:        string | null
+  canonicalStoredLocation:  string | null
+  groupedReportingLocation: GroupedReportingLocation | null
+  contractRef:              string
+  contractDate:             Date | null
+  contractStartDate:        Date | null
+  contractEndDate:          Date | null
+  rawContractQtyFile2:      Prisma.Decimal | null
+  derivedReleaseSumFile1:   null
+  effectiveContractQty:     Prisma.Decimal
+  qtySource:                string
+  qtyReviewFlag:            boolean
+  qtyReviewNote:            string | null
+  price:                    Prisma.Decimal | null
+  currency:                 Currency | null
+  customerContractRef:      string | null
+  deliveryTerms:            string | null
+  status:                   ContractStatus
+  settledTonnes:            Prisma.Decimal | null
+  unshippedTonnes:          Prisma.Decimal | null
+  importSessionId:          number
+}
+
+// ── Flow result types ─────────────────────────────────────────────────────────
+export type RowOutcome = 'pending' | 'skipped' | 'error'
+
+export interface ProcessedRow {
+  rowNumber:    number
+  outcome:      RowOutcome
+  rawData:      File2RawRow
+  mappedData:   File2MappedRow
+  resolvedIds:  File2ResolvedIds
+  errors:       string[]
+  skippedReason?: string
+}
+
+// FIX 4: resolutionSummary added to RunResult.
+export interface ResolutionSummary {
+  commoditiesUnresolved:  number
+  customersAutoCreated:   number
+  customersReviewFlagged: number
+  locationsRemapped:      number
+  locationsHistorical:    number
+  qtyReviewFlagged:       number
+}
+
+export interface RunResult {
+  sessionId:         number
+  rowsTotal:         number
+  rowsPending:       number
+  rowsSkipped:       number
+  rowsError:         number
+  resolutionSummary: ResolutionSummary   // FIX 4
+  rows:              ProcessedRow[]
+}
+
+export interface CommitResult {
+  sessionId:    number
+  rowsCreated:  number
+  rowsUpdated:  number
+  rowsErrored:  number
+  dbErrors:     { contractRef: string; message: string }[]
+}

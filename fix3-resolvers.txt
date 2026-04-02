@@ -1,0 +1,284 @@
+// lib/import/resolvers/resolvers.ts
+// Fix 3 applied: customerMatchedBy added to CustomerResolveResult and
+// every return branch of resolveCustomer().
+// commodity and location resolvers unchanged.
+
+import { PrismaClient, GroupedReportingLocation } from '@prisma/client'
+
+const prisma = new PrismaClient()
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// COMMODITY RESOLVER — unchanged
+// ═════════════════════════════════════════════════════════════════════════════
+
+export interface CommodityResolveSuccess {
+  commodityId:  number
+  resolvedName: string
+  error:        null
+}
+export interface CommodityResolveFailure {
+  commodityId:  null
+  resolvedName: null
+  error:        string
+}
+export type CommodityResolveResult = CommodityResolveSuccess | CommodityResolveFailure
+
+export async function resolveCommodity(
+  rawValue: string | null | undefined,
+): Promise<CommodityResolveResult> {
+  const v = rawValue?.trim()
+  if (!v) {
+    return { commodityId: null, resolvedName: null, error: 'Commodity value is blank' }
+  }
+
+  // 1. Alias lookup
+  const alias = await prisma.entityAlias.findUnique({
+    where:   { entityType_rawValue: { entityType: 'COMMODITY', rawValue: v } },
+    include: { commodity: { select: { id: true, name: true } } },
+  })
+  if (alias?.commodity) {
+    return { commodityId: alias.commodity.id, resolvedName: alias.commodity.name, error: null }
+  }
+
+  // 2. Exact name match
+  const exact = await prisma.commodity.findUnique({
+    where:  { name: v },
+    select: { id: true, name: true },
+  })
+  if (exact) return { commodityId: exact.id, resolvedName: exact.name, error: null }
+
+  // 3. Case-insensitive match
+  const loose = await prisma.commodity.findFirst({
+    where:  { name: { equals: v, mode: 'insensitive' } },
+    select: { id: true, name: true },
+  })
+  if (loose) return { commodityId: loose.id, resolvedName: loose.name, error: null }
+
+  // 4. Fail
+  return {
+    commodityId:  null,
+    resolvedName: null,
+    error: `Unresolved commodity: "${v}". Add an entity_alias (COMMODITY) for this value and re-run.`,
+  }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CUSTOMER RESOLVER
+// FIX 3: customerMatchedBy added to CustomerResolveResult and all return branches.
+// ═════════════════════════════════════════════════════════════════════════════
+
+const FF_STRAIGHTS = 'BPLSE'
+const FF_MILLS     = 'BOCMS'
+const FF_PATTERN   = /forfarmers/i
+
+// FIX 3: customerMatchedBy added here.
+export interface CustomerResolveResult {
+  customerId:         number
+  canonicalName:      string
+  customerCreated:    boolean
+  customerReviewFlag: boolean
+  customerMatchedBy:  'ff_straights' | 'ff_mills' | 'alias' | 'exact' | 'loose' | 'created'
+}
+
+export async function resolveCustomer(
+  rawName:     string | null | undefined,
+  accountCode: string | null | undefined,
+): Promise<CustomerResolveResult> {
+  const name = rawName?.trim() ?? ''
+  const code = accountCode?.trim() ?? ''
+
+  // ── a. ForFarmers known split ─────────────────────────────────────────────
+  if (FF_PATTERN.test(name)) {
+    if (code === FF_STRAIGHTS) {
+      const c = await prisma.customer.findUniqueOrThrow({
+        where:  { canonicalName_accountCode: { canonicalName: 'ForFarmers UK – Straights', accountCode: FF_STRAIGHTS } },
+        select: { id: true, canonicalName: true },
+      })
+      return {
+        customerId:         c.id,
+        canonicalName:      c.canonicalName,
+        customerCreated:    false,
+        customerReviewFlag: false,
+        customerMatchedBy:  'ff_straights',   // FIX 3
+      }
+    }
+    if (code === FF_MILLS) {
+      const c = await prisma.customer.findUniqueOrThrow({
+        where:  { canonicalName_accountCode: { canonicalName: 'ForFarmers UK – Mills', accountCode: FF_MILLS } },
+        select: { id: true, canonicalName: true },
+      })
+      return {
+        customerId:         c.id,
+        canonicalName:      c.canonicalName,
+        customerCreated:    false,
+        customerReviewFlag: false,
+        customerMatchedBy:  'ff_mills',       // FIX 3
+      }
+    }
+    // ForFarmers with unexpected code — fall through to general resolution
+  }
+
+  // ── b. Alias lookup ───────────────────────────────────────────────────────
+  const alias = await prisma.entityAlias.findUnique({
+    where:   { entityType_rawValue: { entityType: 'CUSTOMER', rawValue: name } },
+    include: { customer: { select: { id: true, canonicalName: true } } },
+  })
+  if (alias?.customer) {
+    return {
+      customerId:         alias.customer.id,
+      canonicalName:      alias.customer.canonicalName,
+      customerCreated:    false,
+      customerReviewFlag: false,
+      customerMatchedBy:  'alias',            // FIX 3
+    }
+  }
+
+  // ── c. Exact composite match (canonicalName + accountCode) ───────────────
+  if (code) {
+    const exact = await prisma.customer.findUnique({
+      where:  { canonicalName_accountCode: { canonicalName: name, accountCode: code } },
+      select: { id: true, canonicalName: true },
+    })
+    if (exact) {
+      return {
+        customerId:         exact.id,
+        canonicalName:      exact.canonicalName,
+        customerCreated:    false,
+        customerReviewFlag: false,
+        customerMatchedBy:  'exact',          // FIX 3
+      }
+    }
+  }
+
+  // ── d. Case-insensitive name match ────────────────────────────────────────
+  const loose = await prisma.customer.findFirst({
+    where:  { canonicalName: { equals: name, mode: 'insensitive' } },
+    select: { id: true, canonicalName: true },
+  })
+  if (loose) {
+    return {
+      customerId:         loose.id,
+      canonicalName:      loose.canonicalName,
+      customerCreated:    false,
+      customerReviewFlag: false,
+      customerMatchedBy:  'loose',            // FIX 3
+    }
+  }
+
+  // ── e. Create new customer ────────────────────────────────────────────────
+  const safeCode = code || `AUTO_${name.toUpperCase().replace(/\s+/g, '_').slice(0, 30)}`
+
+  const created = await prisma.customer.create({
+    data: {
+      canonicalName: name,
+      shortName:     name.slice(0, 20),
+      accountCode:   safeCode,
+      isActive:      true,
+      notes:         'Auto-created during File2 import. Review canonical name and accountCode.',
+    },
+    select: { id: true, canonicalName: true },
+  })
+
+  return {
+    customerId:         created.id,
+    canonicalName:      created.canonicalName,
+    customerCreated:    true,
+    customerReviewFlag: true,
+    customerMatchedBy:  'created',            // FIX 3
+  }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// LOCATION RESOLVER — unchanged
+// ═════════════════════════════════════════════════════════════════════════════
+
+export type LocationSide = 'SALES' | 'PURCHASE' | 'COLLECTIONS'
+
+export interface LocationResolveResult {
+  rawSourceLocation:        string | null
+  canonicalStoredLocation:  string | null
+  groupedReportingLocation: GroupedReportingLocation | null
+  locationNote:             string | null
+}
+
+const SALES_MAP: Record<string, { canonical: string; grouped: GroupedReportingLocation }> = {
+  'NEWPORT':     { canonical: 'Newport',    grouped: 'Newport'    },
+  'AVONMOUTH':   { canonical: 'Avonmouth',  grouped: 'Avonmouth'  },
+  'GARSTON':     { canonical: 'Garston',    grouped: 'Garston'    },
+  'LIVERPOOL':   { canonical: 'Kenyon',     grouped: 'Kenyon'     },
+  'ORMSKIRK':    { canonical: 'Kenyon',     grouped: 'Kenyon'     },
+  'BIRCHENHOL':  { canonical: 'Kenyon',     grouped: 'Kenyon'     },
+  'BURCHENHOLT': { canonical: 'Kenyon',     grouped: 'Kenyon'     },
+  'ARDENS':      { canonical: 'Kenyon',     grouped: 'Kenyon'     },
+  'DIRECTSALE':  { canonical: 'Directsale', grouped: 'Directsale' },
+  'IRELAND':     { canonical: 'Ireland',    grouped: 'Ireland'    },
+}
+
+const NULL_VALUES = new Set(['UK', 'uk'])
+
+export async function resolveLocation(
+  rawValue: string | null | undefined,
+  side:     LocationSide,
+): Promise<LocationResolveResult> {
+  const raw = rawValue?.trim() ?? null
+
+  if (!raw) {
+    return { rawSourceLocation: null, canonicalStoredLocation: null, groupedReportingLocation: null, locationNote: null }
+  }
+
+  if (NULL_VALUES.has(raw)) {
+    return { rawSourceLocation: raw, canonicalStoredLocation: null, groupedReportingLocation: null, locationNote: 'Source value "UK" — canonical and grouped intentionally null' }
+  }
+
+  if (side === 'PURCHASE' && raw.toUpperCase() === 'LIVERPOOL') {
+    return {
+      rawSourceLocation:        raw,
+      canonicalStoredLocation:  'Liverpool',
+      groupedReportingLocation: 'Liverpool',
+      locationNote:             'Purchase-side: Liverpool retained as port of intake',
+    }
+  }
+
+  if (side === 'COLLECTIONS') {
+    const alias = await prisma.entityAlias.findUnique({
+      where: { entityType_rawValue: { entityType: 'LOCATION', rawValue: raw } },
+    })
+    if (alias?.canonicalLocationName) {
+      const loc = await prisma.location.findUnique({
+        where:  { canonicalName: alias.canonicalLocationName },
+        select: { groupedReportingLocation: true },
+      })
+      return {
+        rawSourceLocation:        raw,
+        canonicalStoredLocation:  alias.canonicalLocationName,
+        groupedReportingLocation: loc?.groupedReportingLocation ?? null,
+        locationNote:             null,
+      }
+    }
+  }
+
+  const upper    = raw.toUpperCase()
+  const firstWord = upper.split(/\s+/)[0]
+  const hit = SALES_MAP[upper] ?? SALES_MAP[firstWord]
+
+  if (hit) {
+    return {
+      rawSourceLocation:        raw,
+      canonicalStoredLocation:  hit.canonical,
+      groupedReportingLocation: hit.grouped,
+      locationNote:             upper !== hit.canonical.toUpperCase()
+        ? `Sales-side: ${raw} remapped to ${hit.canonical}`
+        : null,
+    }
+  }
+
+  return {
+    rawSourceLocation:        raw,
+    canonicalStoredLocation:  null,
+    groupedReportingLocation: 'Historical',
+    locationNote:             `No mapping found for "${raw}". Grouped as Historical. Add entity_alias (LOCATION) if this is a current location.`,
+  }
+}

@@ -1,0 +1,846 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Feed Factors — Prototype Prisma Schema
+// PostgreSQL / Railway
+// ─────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum Currency {
+  GBP
+  USD
+  EUR
+}
+
+enum ContractStatus {
+  ACTIVE
+  CLOSED
+  CANCELLED
+  ON_HOLD
+}
+
+enum ReleaseMonthStatus {
+  OPEN
+  CLOSED
+  DELINQUENT
+}
+
+enum ReleaseSource {
+  FILE1_IMPORT
+  MANUAL
+  DELINQUENCY_ADJUSTMENT
+}
+
+enum DelinquencyAction {
+  PENDING
+  SPREAD_FORWARD
+  WRITTEN_OFF
+  CONFIRMED
+}
+
+enum BatchStatus {
+  SCHEDULED
+  EXECUTED
+  PARTIAL
+  CANCELLED
+}
+
+enum VesselStatus {
+  SCHEDULED
+  LOADING
+  AT_SEA
+  AT_PORT
+  DISCHARGED
+  CANCELLED
+}
+
+enum ForecastLineType {
+  OPENING_STOCK
+  INBOUND
+  OUTBOUND
+  CLOSING_STOCK
+  TRADER_OVERRIDE
+}
+
+enum ImportStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  COMPLETED_WITH_ERRORS
+  FAILED
+}
+
+enum AlertSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum AlertStatus {
+  OPEN
+  ACKNOWLEDGED
+  RESOLVED
+  DISMISSED
+}
+
+enum NoteEntityType {
+  SALES_CONTRACT
+  SALES_RELEASE
+  COLLECTION
+  PURCHASE_CONTRACT
+  BATCH
+  VESSEL
+  STOCK_SNAPSHOT
+  CUSTOMER
+  COMMODITY
+  IMPORT_SESSION
+  GENERAL
+}
+
+enum AliasEntityType {
+  CUSTOMER
+  COMMODITY
+  LOCATION
+  SUPPLIER
+}
+
+// Grouped reporting location — the roll-up used in all dashboards and reports.
+// Historical = legacy source locations with no current canonical mapping.
+// Unknown    = fallback for unmapped imports; should be reviewed.
+enum GroupedReportingLocation {
+  Kenyon
+  Newport
+  Avonmouth
+  Garston
+  Directsale
+  Ireland
+  Halder
+  Historical
+  Unknown
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REFERENCE / SEED TABLES
+// ─────────────────────────────────────────────────────────────────────────────
+
+// 15 locked commodities — seeded from agreed prototype list.
+// Additional source names are handled through EntityAlias, not as new rows here.
+model Commodity {
+  id        Int     @id @default(autoincrement())
+  name      String  @unique   // e.g. "Soya", "Maize (Ground)"
+  shortName String?           // optional short UI label
+  isActive  Boolean @default(true)
+  sortOrder Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  salesContracts    SalesContract[]
+  purchaseContracts PurchaseContract[]
+  stockSnapshots    StockSnapshot[]
+  collections       Collection[]
+  vesselLines       VesselLine[]
+  forecastLines     ForecastLine[]
+  aliases           EntityAlias[]
+
+  @@map("commodities")
+}
+
+// Canonical location registry — one row per current active location.
+// Historical / unmappable source locations are NOT seeded here;
+// they are preserved in rawSourceLocation on each record and grouped as Historical.
+model Location {
+  id                       Int                       @id @default(autoincrement())
+  canonicalName            String                    @unique  // e.g. "Kenyon", "Newport"
+  groupedReportingLocation GroupedReportingLocation?
+  isActive                 Boolean                   @default(true)
+  notes                    String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("locations")
+}
+
+// Customers — the ForFarmers split produces two separate rows:
+//   FORFARMERS UK LTD / BPLSE  → "ForFarmers UK – Straights"
+//   FORFARMERS UK LTD / BOCMS  → "ForFarmers UK – Mills"
+// Uniqueness is enforced on (canonicalName, accountCode) so both can coexist.
+model Customer {
+  id            Int     @id @default(autoincrement())
+  canonicalName String
+  shortName     String?
+  accountCode   String?           // source account code / Id field
+  isActive      Boolean @default(true)
+  notes         String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  salesContracts SalesContract[]
+  collections    Collection[]
+  aliases        EntityAlias[]
+
+  @@unique([canonicalName, accountCode])
+  @@map("customers")
+}
+
+model Supplier {
+  id            Int     @id @default(autoincrement())
+  canonicalName String  @unique
+  shortName     String?
+  country       String?
+  isActive      Boolean @default(true)
+  notes         String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  purchaseContracts PurchaseContract[]
+  aliases           EntityAlias[]
+
+  @@map("suppliers")
+}
+
+// Alias table — maps raw source strings to canonical entities.
+// Exactly one of (commodityId, customerId, supplierId, canonicalLocationName) should be set
+// depending on entityType.  Location aliases store the target name as a plain string
+// to avoid a circular FK back to the locations table.
+model EntityAlias {
+  id                    Int             @id @default(autoincrement())
+  entityType            AliasEntityType
+  rawValue              String          // exact string as found in source file
+  commodityId           Int?
+  customerId            Int?
+  supplierId            Int?
+  canonicalLocationName String?         // used when entityType = LOCATION
+  notes                 String?
+
+  createdAt DateTime @default(now())
+
+  commodity Commodity? @relation(fields: [commodityId], references: [id])
+  customer  Customer?  @relation(fields: [customerId],  references: [id])
+  supplier  Supplier?  @relation(fields: [supplierId],  references: [id])
+
+  @@unique([entityType, rawValue])
+  @@map("entity_aliases")
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SALES CONTRACTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One row per contract.  File 2 (ContractUnpricedpricedsettledQuantitiesQuery)
+// is the authoritative source for contract-level data.
+// File 1 (ContractRelease-CalendarSpreadQuery) fills release rows.
+model SalesContract {
+  id                     Int            @id @default(autoincrement())
+  contractRef            String         @unique
+  contractDate           DateTime?
+  contractStartDate      DateTime?
+  contractEndDate        DateTime?
+
+  customerId  Int
+  commodityId Int
+
+  contractQuantityTonnes Decimal        @db.Decimal(12, 3)
+  price                  Decimal?       @db.Decimal(10, 4)
+  currency               Currency?
+  customerContractRef    String?        // customer PO / their own reference
+  deliveryTerms          String?
+  status                 ContractStatus @default(ACTIVE)
+
+  // Location — 3-field model
+  rawSourceLocation        String?
+  canonicalStoredLocation  String?      // plain string cross-referencing locations.canonicalName
+  groupedReportingLocation GroupedReportingLocation?
+
+  // Quantity source / review fields
+  // quantitySourceFile tracks which file provided the contract quantity.
+  // quantityReviewFlag marks records needing manual QA before going live.
+  quantitySourceFile String?           // "File2" | "File1" | "Manual"
+  quantityReviewFlag Boolean @default(false)
+  quantityReviewNote String?
+
+  // Settled / unshipped measures from File 2 — stored for display; not KPI inputs.
+  settledTonnes   Decimal? @db.Decimal(12, 3)
+  unshippedTonnes Decimal? @db.Decimal(12, 3)
+
+  importSessionId Int?
+  notes           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  customer      Customer       @relation(fields: [customerId],      references: [id])
+  commodity     Commodity      @relation(fields: [commodityId],     references: [id])
+  importSession ImportSession? @relation(fields: [importSessionId], references: [id])
+  releases      SalesRelease[]
+
+  @@index([customerId])
+  @@index([commodityId])
+  @@index([status])
+  @@index([contractStartDate, contractEndDate])
+  @@map("sales_contracts")
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SALES RELEASES
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One row per release line / release month per contract.
+// Sourced from File 1 (ContractRelease-CalendarSpreadQuery).
+//
+// GENERATED COLUMN NOTE — effectiveTonnes:
+//   Business rule: effectiveTonnes = COALESCE(adjustedTonnes, releasedTonnes)
+//   Prisma does not natively model PostgreSQL GENERATED ALWAYS AS columns.
+//   In v1 this field is populated by the application layer on every write.
+//   A follow-up raw migration can promote it to a true generated column;
+//   see implementation notes at the bottom of this file.
+model SalesRelease {
+  id              Int                @id @default(autoincrement())
+  salesContractId Int
+  releaseNumber   Int?
+  releaseMonth    DateTime           // stored as first day of month (e.g. 2026-03-01)
+
+  releasedTonnes   Decimal            @db.Decimal(12, 3)
+  adjustedTonnes   Decimal?           @db.Decimal(12, 3)  // trader override; null = not adjusted
+  effectiveTonnes  Decimal?           @db.Decimal(12, 3)  // COALESCE(adjusted, released) — see note
+  balanceTonnes    Decimal?           @db.Decimal(12, 3)
+  delinquentTonnes Decimal?           @db.Decimal(12, 3)
+  allocatedTonnes  Decimal?           @db.Decimal(12, 3)
+
+  monthStatus ReleaseMonthStatus @default(OPEN)
+  source      ReleaseSource      @default(FILE1_IMPORT)
+
+  // Location carried from source row (may differ from contract-level location)
+  rawSourceLocation        String?
+  canonicalStoredLocation  String?
+  groupedReportingLocation GroupedReportingLocation?
+
+  importSessionId Int?
+  notes           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  salesContract          SalesContract           @relation(fields: [salesContractId], references: [id])
+  importSession          ImportSession?          @relation(fields: [importSessionId], references: [id])
+  delinquencyAdjustments DelinquencyAdjustment[]
+
+  @@unique([salesContractId, releaseMonth])
+  @@index([salesContractId])
+  @@index([releaseMonth])
+  @@index([monthStatus])
+  @@map("sales_releases")
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELINQUENCY ADJUSTMENTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Lifecycle record for every delinquency shortfall on a closed release month.
+// SPREAD_FORWARD: updates adjustedTonnes on the target release row.
+// WRITTEN_OFF:    closes the shortfall with no forward carry.
+// CONFIRMED:      trader has reviewed and approved the system proposal.
+model DelinquencyAdjustment {
+  id             Int               @id @default(autoincrement())
+  salesReleaseId Int               // the closed release month with the shortfall
+
+  action          DelinquencyAction @default(PENDING)
+  shortfallTonnes Decimal           @db.Decimal(12, 3)
+
+  spreadToMonth DateTime? // target release month (first day of month)
+  spreadTonnes  Decimal?  @db.Decimal(12, 3)
+  writeOffTonnes Decimal? @db.Decimal(12, 3)
+
+  confirmedByUserId String?
+  confirmedAt       DateTime?
+  notes             String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  salesRelease SalesRelease @relation(fields: [salesReleaseId], references: [id])
+
+  @@index([salesReleaseId])
+  @@map("delinquency_adjustments")
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COLLECTIONS (WEIGHBRIDGE / TICKET OUTBOUND)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One row per weighbridge ticket.  Source: File 4 (TicketApplicationQuery CSV).
+// Only Cont = INV rows are imported.  The 13 corrupt rows are excluded at import.
+//
+// Contract linking:
+//   sourceContractRef — ticket system ref from CSV (does NOT match sales_contract.contractRef)
+//   salesContractId   — resolved FK, set by post-import auto-linker or manual assignment
+//
+// ForFarmers limitation:
+//   The CSV contains no account code.  ForFarmers tickets are imported as a single
+//   temporary customer entity; forfarmersUnresolved = true flags them for review.
+model Collection {
+  id             Int      @id @default(autoincrement())
+  collectionDate DateTime
+
+  customerId  Int
+  commodityId Int
+
+  tonnage  Decimal  @db.Decimal(12, 3)
+  weightKg Decimal? @db.Decimal(14, 3)  // raw weight in kg from source
+
+  ticketRef         String?
+  vehicleReg        String?
+  haulier           String?
+  sourceContractRef String?  // ticket-system ref; not a FK
+  salesContractId   Int?     // resolved FK — nullable until auto-linker runs
+  batchRef          String?  // where derivable from Reference field
+
+  forfarmersUnresolved Boolean @default(false)
+
+  // Location — 3-field model
+  rawSourceLocation        String?
+  canonicalStoredLocation  String?
+  groupedReportingLocation GroupedReportingLocation?
+
+  importSessionId Int?
+  notes           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  customer      Customer       @relation(fields: [customerId],      references: [id])
+  commodity     Commodity      @relation(fields: [commodityId],     references: [id])
+  importSession ImportSession? @relation(fields: [importSessionId], references: [id])
+
+  @@index([customerId])
+  @@index([commodityId])
+  @@index([collectionDate])
+  @@index([salesContractId])
+  @@map("collections")
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PURCHASE CONTRACTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Note: for purchases, Liverpool remains "Liverpool" as the actual intake port.
+// It is NOT remapped to Kenyon (unlike sales-side source data).
+model PurchaseContract {
+  id                     Int            @id @default(autoincrement())
+  contractRef            String         @unique
+  contractDate           DateTime?
+  contractStartDate      DateTime?
+  contractEndDate        DateTime?
+
+  supplierId  Int
+  commodityId Int
+
+  contractQuantityTonnes Decimal        @db.Decimal(12, 3)
+  price                  Decimal?       @db.Decimal(10, 4)
+  currency               Currency?
+  deliveryTerms          String?
+  originCountry          String?
+  status                 ContractStatus @default(ACTIVE)
+
+  // Location — 3-field model
+  rawSourceLocation        String?
+  canonicalStoredLocation  String?
+  groupedReportingLocation GroupedReportingLocation?
+
+  importSessionId Int?
+  notes           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  supplier      Supplier       @relation(fields: [supplierId],     references: [id])
+  commodity     Commodity      @relation(fields: [commodityId],    references: [id])
+  importSession ImportSession? @relation(fields: [importSessionId], references: [id])
+  batches       Batch[]
+
+  @@index([supplierId])
+  @@index([commodityId])
+  @@index([status])
+  @@map("purchase_contracts")
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BATCHES (PURCHASE EXECUTION)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Batch {
+  id                 Int         @id @default(autoincrement())
+  batchRef           String      @unique
+  purchaseContractId Int
+
+  executedDate   DateTime?
+  quantityTonnes Decimal     @db.Decimal(12, 3)
+  status         BatchStatus @default(SCHEDULED)
+
+  // Location — 3-field model
+  rawSourceLocation        String?
+  canonicalStoredLocation  String?
+  groupedReportingLocation GroupedReportingLocation?
+
+  importSessionId Int?
+  notes           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  purchaseContract PurchaseContract @relation(fields: [purchaseContractId], references: [id])
+  importSession    ImportSession?   @relation(fields: [importSessionId],    references: [id])
+  vesselLines      VesselLine[]
+  stockSnapshots   StockSnapshot[]
+
+  @@index([purchaseContractId])
+  @@map("batches")
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VESSELS
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Vessel {
+  id              Int          @id @default(autoincrement())
+  vesselName      String
+  voyageRef       String?
+  status          VesselStatus @default(SCHEDULED)
+  eta             DateTime?
+  etd             DateTime?
+  dischargeDate   DateTime?
+  portOfLoading   String?
+  portOfDischarge String?
+
+  importSessionId Int?
+  notes           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  importSession ImportSession?    @relation(fields: [importSessionId], references: [id])
+  lines         VesselLine[]
+  statusLog     VesselStatusLog[]
+
+  @@unique([vesselName, voyageRef])
+  @@map("vessels")
+}
+
+// One row per commodity parcel within a vessel.
+model VesselLine {
+  id              Int     @id @default(autoincrement())
+  vesselId        Int
+  commodityId     Int
+  batchId         Int?
+  quantityTonnes  Decimal @db.Decimal(12, 3)
+  billOfLadingRef String?
+
+  // Location — discharge / destination
+  rawSourceLocation        String?
+  canonicalStoredLocation  String?
+  groupedReportingLocation GroupedReportingLocation?
+
+  importSessionId Int?
+  notes           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  vessel        Vessel         @relation(fields: [vesselId],        references: [id])
+  commodity     Commodity      @relation(fields: [commodityId],     references: [id])
+  batch         Batch?         @relation(fields: [batchId],         references: [id])
+  importSession ImportSession? @relation(fields: [importSessionId], references: [id])
+
+  @@index([vesselId])
+  @@index([commodityId])
+  @@map("vessel_lines")
+}
+
+// Full audit trail of every status transition for a vessel.
+model VesselStatusLog {
+  id       Int          @id @default(autoincrement())
+  vesselId Int
+  status   VesselStatus
+  loggedAt DateTime     @default(now())
+  loggedBy String?
+  notes    String?
+
+  vessel Vessel @relation(fields: [vesselId], references: [id])
+
+  @@index([vesselId])
+  @@map("vessel_status_log")
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STOCK SNAPSHOTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One row per batch per tab in the Weekly Physical Stocks workbook.
+// snapshotDate is derived from the Master header (Last Week = This Week − 7 days).
+// Newport batch 67701 is corrected to Maize (Ground) at import time.
+// kenyonSubLocation carries sub-location detail from the "Vessel" column
+// (Arden / Burchenholt / IBCs etc.) where present.
+model StockSnapshot {
+  id           Int      @id @default(autoincrement())
+  snapshotDate DateTime
+  commodityId  Int
+
+  tonnage  Decimal @db.Decimal(12, 3)
+  batchRef String?
+  batchId  Int?
+
+  // Location — 3-field model
+  rawSourceLocation        String?
+  canonicalStoredLocation  String?
+  groupedReportingLocation GroupedReportingLocation?
+
+  kenyonSubLocation String?   // from "Vessel" column where meaningful
+  sourceSheet       String?   // e.g. "NP This Week", "Last Week AV"
+
+  importSessionId Int?
+  notes           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  commodity     Commodity      @relation(fields: [commodityId],     references: [id])
+  batch         Batch?         @relation(fields: [batchId],         references: [id])
+  importSession ImportSession? @relation(fields: [importSessionId], references: [id])
+
+  @@index([snapshotDate])
+  @@index([commodityId])
+  @@index([canonicalStoredLocation])
+  @@map("stock_snapshots")
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FORECASTING
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One ForecastRun per execution of the forecast engine (weekly or on demand).
+// Each run generates ForecastLine rows: OPENING_STOCK, INBOUND, OUTBOUND, CLOSING_STOCK
+// per commodity per week across the 12-week horizon.
+// TRADER_OVERRIDE lines replace engine-calculated lines where the trader has intervened.
+model ForecastRun {
+  id              Int      @id @default(autoincrement())
+  runDate         DateTime @default(now())
+  horizonWeeks    Int      @default(12)
+  createdByUserId String?
+  notes           String?
+
+  createdAt DateTime @default(now())
+
+  lines ForecastLine[]
+
+  @@map("forecast_runs")
+}
+
+model ForecastLine {
+  id            Int              @id @default(autoincrement())
+  forecastRunId Int
+  commodityId   Int
+  weekStartDate DateTime         // Monday of the forecast week
+
+  lineType    ForecastLineType
+  tonnesValue Decimal          @db.Decimal(12, 3)
+
+  isTraderOverride Boolean @default(false)
+  overrideNote     String?
+
+  // Optional location scope — null = commodity-total (all locations combined)
+  canonicalStoredLocation  String?
+  groupedReportingLocation GroupedReportingLocation?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  forecastRun ForecastRun @relation(fields: [forecastRunId], references: [id])
+  commodity   Commodity   @relation(fields: [commodityId],   references: [id])
+
+  @@index([forecastRunId])
+  @@index([commodityId])
+  @@index([weekStartDate])
+  @@map("forecast_lines")
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IMPORT PIPELINE
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One ImportSession per file upload.
+// All imported entities carry importSessionId as a traceable FK.
+// Full rollback of an import is achievable by nullifying / deleting by sessionId.
+model ImportSession {
+  id              Int          @id @default(autoincrement())
+  templateId      Int?
+  filename        String
+  fileType        String       // "xlsx" | "csv"
+  status          ImportStatus @default(PENDING)
+  rowsTotal       Int?
+  rowsImported    Int?
+  rowsSkipped     Int?
+  rowsErrored     Int?
+  startedAt       DateTime?
+  completedAt     DateTime?
+  createdByUserId String?
+  notes           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  template          ImportTemplate?    @relation(fields: [templateId], references: [id])
+  rows              ImportRow[]
+  salesContracts    SalesContract[]
+  salesReleases     SalesRelease[]
+  collections       Collection[]
+  purchaseContracts PurchaseContract[]
+  batches           Batch[]
+  vessels           Vessel[]
+  vesselLines       VesselLine[]
+  stockSnapshots    StockSnapshot[]
+
+  @@map("import_sessions")
+}
+
+// Per-file column mapping and transform/filter rules stored as JSON.
+// Minimum templates needed for v1:
+//   - "File1 Sales Releases"
+//   - "File2 Sales Contracts"
+//   - "File4 Collections CSV"
+//   - "Stock NP" / "Stock AV" / "Stock Kenyon" / "Stock GA" / "Stock HA"  (5 location pairs = 5 templates)
+model ImportTemplate {
+  id            Int     @id @default(autoincrement())
+  name          String  @unique
+  fileType      String            // "xlsx" | "csv"
+  targetEntity  String            // "sales_contracts" | "sales_releases" | "stock_snapshots" | "collections" | ...
+  columnMappings Json             // { "Source Column": "targetFieldName", ... }
+  filterRules    Json?            // e.g. { "Cont": "INV" }
+  transformRules Json?            // e.g. { "dateFormat": "DD/MM/YYYY", "weightUnit": "kg" }
+  isActive      Boolean @default(true)
+  notes         String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sessions ImportSession[]
+
+  @@map("import_templates")
+}
+
+// One row per source row processed in a session.
+// rawData preserves the original parsed row as JSON for audit and re-processing.
+model ImportRow {
+  id              Int    @id @default(autoincrement())
+  importSessionId Int
+  rowNumber       Int
+  rawData         Json   // original row as parsed from source file
+  status          String // "imported" | "skipped" | "error" | "pending"
+  errorMessage    String?
+  skippedReason   String?
+
+  createdAt DateTime @default(now())
+
+  importSession ImportSession @relation(fields: [importSessionId], references: [id])
+
+  @@index([importSessionId])
+  @@index([status])
+  @@map("import_rows")
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NOTES
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Polymorphic notes table.  entityType + entityId reference any entity by its PK.
+// No FK constraint is declared (polymorphic FK is not expressible in Prisma/Postgres
+// without a check constraint per entity type).
+// Application layer enforces referential integrity.
+model Note {
+  id              Int            @id @default(autoincrement())
+  entityType      NoteEntityType
+  entityId        Int
+  body            String
+  isPinned        Boolean        @default(false)
+  createdByUserId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([entityType, entityId])
+  @@map("notes")
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// System-generated and manually created alerts for the Attention Centre.
+// category is a plain string (not an enum) so new alert types can be added
+// without a schema migration — e.g. "delinquency", "stock_runout",
+// "vessel_overdue", "import_error", "contract_expiry".
+model Alert {
+  id               Int           @id @default(autoincrement())
+  severity         AlertSeverity
+  status           AlertStatus   @default(OPEN)
+  category         String        // freeform; see examples above
+  entityType       String?       // e.g. "sales_contract"
+  entityId         Int?          // PK of the referenced entity
+  title            String
+  body             String?
+  resolvedAt       DateTime?
+  resolvedByUserId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([severity])
+  @@index([category])
+  @@map("alerts")
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FX RATES
+// ─────────────────────────────────────────────────────────────────────────────
+
+model FxRate {
+  id            Int      @id @default(autoincrement())
+  fromCurrency  Currency
+  toCurrency    Currency
+  rate          Decimal  @db.Decimal(12, 6)
+  effectiveDate DateTime
+  source        String?  // "manual" | "ecb" | "import"
+
+  createdAt DateTime @default(now())
+
+  @@unique([fromCurrency, toCurrency, effectiveDate])
+  @@map("fx_rates")
+}

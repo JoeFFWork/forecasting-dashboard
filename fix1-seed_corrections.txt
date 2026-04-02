@@ -1,0 +1,93 @@
+// lib/import/file2/seed_corrections.ts
+// Fix 1 applied: shortCode → shortName in seedCustomers() only.
+// Commodity model uses shortCode (correct). Customer model uses shortName (corrected here).
+
+import { PrismaClient } from '@prisma/client'
+const prisma = new PrismaClient()
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 1 — seedCommodities()
+// Commodity.shortCode is correct — no change needed here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function seedCommodities() {
+  console.log('  → Commodities...')
+
+  const commodities = [
+    { name: 'Soya',           shortCode: 'Soya',      sortOrder: 1  },
+    { name: 'Sunmeal',        shortCode: 'Sunmeal',   sortOrder: 2  },
+    { name: 'Feed Wheat',     shortCode: 'Fd Wheat',  sortOrder: 3  },
+    { name: 'Maize',          shortCode: 'Maize',     sortOrder: 4  },
+    { name: 'Maize (Ground)', shortCode: 'Grd Maize', sortOrder: 5  },
+    { name: 'Milling Wheat',  shortCode: 'Ml Wheat',  sortOrder: 6  },
+    { name: 'Hi Pro Wheat',   shortCode: 'Hi Pro',    sortOrder: 7  },
+    { name: 'Lucerne',        shortCode: 'Lucerne',   sortOrder: 8  },
+    { name: 'Soya Oil',       shortCode: 'Soya Oil',  sortOrder: 9  },
+    { name: 'Sweet Potato',   shortCode: 'Sw Potato', sortOrder: 10 },
+    { name: 'Tapioca',        shortCode: 'Tapioca',   sortOrder: 11 },
+    { name: 'Oats',           shortCode: 'Oats',      sortOrder: 12 },
+    { name: 'Horsebeans',     shortCode: 'Horsebns',  sortOrder: 13 },
+    { name: 'Feed Peas',      shortCode: 'Fd Peas',   sortOrder: 14 },
+    { name: 'Fishmeal',       shortCode: 'Fishmeal',  sortOrder: 15 },
+  ]
+
+  for (const c of commodities) {
+    await prisma.commodity.upsert({
+      where:  { name: c.name },
+      update: { shortCode: c.shortCode, sortOrder: c.sortOrder, isActive: true },
+      create: { ...c, isActive: true },
+    })
+  }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 2 — seedCustomers()
+// FIX 1 APPLIED: shortCode → shortName throughout this function.
+// Customer.shortName is the correct schema field name.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function seedCustomers() {
+  console.log('  → Customers (locked rows)...')
+
+  // ForFarmers UK – Straights (account code BPLSE)
+  await prisma.customer.upsert({
+    where:  { canonicalName_accountCode: { canonicalName: 'ForFarmers UK – Straights', accountCode: 'BPLSE' } },
+    update: { shortName: 'FF Straights', isActive: true },
+    create: {
+      canonicalName: 'ForFarmers UK – Straights',
+      shortName:     'FF Straights',
+      accountCode:   'BPLSE',
+      isActive:      true,
+      notes:         'ForFarmers UK Ltd / Straights division. Identified by accountCode = BPLSE in File 1 and File 2. Do not merge with FF Mills.',
+    },
+  })
+
+  // ForFarmers UK – Mills (account code BOCMS)
+  await prisma.customer.upsert({
+    where:  { canonicalName_accountCode: { canonicalName: 'ForFarmers UK – Mills', accountCode: 'BOCMS' } },
+    update: { shortName: 'FF Mills', isActive: true },
+    create: {
+      canonicalName: 'ForFarmers UK – Mills',
+      shortName:     'FF Mills',
+      accountCode:   'BOCMS',
+      isActive:      true,
+      notes:         'ForFarmers UK Ltd / Mills division. Identified by accountCode = BOCMS in File 1 and File 2. Do not merge with FF Straights.',
+    },
+  })
+
+  // Temporary unresolved ForFarmers — File 4 collections only.
+  // accountCode = 'UNRESOLVED' is a deliberate sentinel value, not null.
+  // All Collection rows linked to this customer must have forfarmersUnresolved = true.
+  await prisma.customer.upsert({
+    where:  { canonicalName_accountCode: { canonicalName: 'ForFarmers UK Ltd', accountCode: 'UNRESOLVED' } },
+    update: { shortName: 'FF Unresolved', isActive: true },
+    create: {
+      canonicalName: 'ForFarmers UK Ltd',
+      shortName:     'FF Unresolved',
+      accountCode:   'UNRESOLVED',
+      isActive:      true,
+      notes:         'Temporary customer for File 4 collections where account code is absent in source. accountCode = UNRESOLVED is a sentinel. Do not use for contracts.',
+    },
+  })
+}
